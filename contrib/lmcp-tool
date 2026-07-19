@@ -1,0 +1,78 @@
+#!/bin/sh
+# lmcp-tool — call a LOCAL lmcp server's tool over a stateless HTTP tools/call.
+#
+# Companion client for lmcp servers (the Lua MCP server): https://git.reauktion.de/marfrit/lmcp
+# Meant to be run through sic — `sic <host> lmcp-tool ...` — so a model drives a
+# remote host's MCP tools without a persistent MCP session. Three forms:
+#
+#   lmcp-tool list                              # DISCOVERY: available tools + descriptions
+#   lmcp-tool <tool> key=value [key=value ...]  # args as pairs — NO json-in-shell (apostrophe-safe)
+#   lmcp-tool <tool> '{"k":"v"}'                # raw JSON (single arg starting with '{')
+#
+# Prefer key=value: `sic host lmcp-tool web_search "query=today's news"` — an apostrophe
+# inside double quotes is fine, and lmcp-tool JSON-encodes the pairs for you.
+#
+# host/port/token come from, in order: $LMCP_HOST/$LMCP_PORT/$LMCP_TOKEN → the lmcp.service
+# systemd unit Environment= → the file it points at via LMCP_CONF (sudo -n if root-only;
+# key godparticle|token|bearer). Defaults to 127.0.0.1:8080.
+tool="$1"
+[ -n "$tool" ] || { echo "usage: lmcp-tool <tool> [ key=value ... | '{json}' ]   |   lmcp-tool list" >&2; exit 2; }
+shift
+
+host="$LMCP_HOST"; port="$LMCP_PORT"; tok="$LMCP_TOKEN"
+env=$(systemctl show lmcp.service -p Environment 2>/dev/null | tr ' ' '\n')
+[ -z "$host" ] && host=$(printf '%s\n' "$env" | sed -n 's/^LMCP_HOST=//p'  | head -1)
+[ -z "$port" ] && port=$(printf '%s\n' "$env" | sed -n 's/^LMCP_PORT=//p'  | head -1)
+[ -z "$tok"  ] && tok=$(printf  '%s\n' "$env" | sed -n 's/^LMCP_TOKEN=//p' | head -1)
+if [ -z "$tok" ]; then
+    conf=$(printf '%s\n' "$env" | sed -n 's/^LMCP_CONF=//p' | head -1)
+    [ -n "$conf" ] && tok=$( { cat "$conf" 2>/dev/null || sudo -n cat "$conf" 2>/dev/null; } \
+        | grep -iE 'godparticle|token|bearer' | grep -oE '[A-Za-z0-9_-]{30,}' | head -1)
+fi
+[ -n "$host" ] || host=127.0.0.1
+[ -n "$port" ] || port=8080
+
+post() {
+    curl -s -m 120 -X POST "http://${host}:${port}/mcp" \
+      -H "Authorization: Bearer ${tok}" -H "Content-Type: application/json" \
+      -H "Accept: application/json, text/event-stream" -d "$1" | sed -n 's/^data: //p'
+}
+
+if [ "$tool" = "list" ] || [ "$tool" = "tools" ] || [ "$tool" = "--list" ]; then
+    post '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 -c '
+import sys, json
+raw = sys.stdin.read().strip()
+if not raw: sys.stderr.write("lmcp-tool: empty response (unreachable or auth failed)\n"); sys.exit(1)
+d = json.loads(raw.splitlines()[-1])
+if "error" in d: sys.stderr.write("lmcp error: %s\n" % d["error"]); sys.exit(1)
+for t in d.get("result", {}).get("tools", []):
+    desc = (t.get("description") or "").splitlines()[0] if t.get("description") else ""
+    print("%-16s %s" % (t.get("name","?"), desc))
+'
+    exit $?
+fi
+
+# build the arguments JSON
+if [ $# -eq 0 ]; then
+    args='{}'
+elif [ $# -eq 1 ] && [ "${1#\{}" != "$1" ]; then
+    args="$1"                                   # single arg starting with '{' = raw JSON
+else
+    args=$(python3 -c 'import sys, json
+print(json.dumps({a.partition("=")[0]: a.partition("=")[2] for a in sys.argv[1:]}))' "$@") \
+        || { echo "lmcp-tool: could not build args from key=value pairs" >&2; exit 2; }
+fi
+
+body=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$tool" "$args")
+post "$body" | python3 -c '
+import sys, json
+raw = sys.stdin.read().strip()
+if not raw: sys.stderr.write("lmcp-tool: empty response (unreachable or auth failed)\n"); sys.exit(1)
+d = json.loads(raw.splitlines()[-1])
+if "error" in d:
+    sys.stderr.write("lmcp error: %s\n" % d["error"])
+    sys.stderr.write("hint: run  lmcp-tool list  to see valid tool names\n"); sys.exit(1)
+r = d.get("result", {})
+print("\n".join(c["text"] for c in r.get("content", []) if c.get("type") == "text"))
+sys.exit(1 if r.get("isError") else 0)
+'

@@ -1,0 +1,13 @@
+#!/bin/sh
+# sicedit <path> <old> <new> — replace the single exact occurrence of <old>
+# with <new> in <path> (edit_file semantics). Args pass losslessly via sic.
+[ $# -ge 3 ] || { echo "usage: sicedit <path> <old> <new>" >&2; exit 2; }
+python3 - "$1" "$2" "$3" <<'PY'
+import sys
+p,o,n=sys.argv[1],sys.argv[2],sys.argv[3]
+s=open(p).read()
+c=s.count(o)
+if c==0: sys.stderr.write("sicedit: old_string not found\n"); sys.exit(1)
+if c>1:  sys.stderr.write("sicedit: old_string not unique (%d matches)\n"%c); sys.exit(1)
+open(p,'w').write(s.replace(o,n,1))
+PY

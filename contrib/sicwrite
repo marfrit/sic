@@ -1,0 +1,5 @@
+#!/bin/sh
+# sicwrite <path> <content> — write content (passed as one argv by sic, so any
+# bytes survive) to path. Replaces the write_file tool for sic on any host.
+[ $# -ge 2 ] || { echo "usage: sicwrite <path> <content>" >&2; exit 2; }
+printf '%s' "$2" > "$1"
