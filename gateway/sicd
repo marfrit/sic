@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""sicd — read netstring-framed argv from stdin and execvp it. Python reference.
+
+Wire format and exec modes: docs/design.md.
+Usage: ssh <host> sicd < <netstring-frames>
+"""
+import sys
+import subprocess
+
+
+def read_netstring(buf):
+    """Read one netstring from buffer. Returns (payload, rest) or None."""
+    i = buf.find(b":")
+    if i < 0:
+        return None
+    try:
+        n = int(buf[:i])
+    except ValueError:
+        return None
+    start = i + 1
+    end = start + n
+    if len(buf) < end + 1 or buf[end : end + 1] != b",":
+        return None
+    return buf[start:end], buf[end + 1 :]
+
+
+def run_frame(mode, args):
+    """Execute a single command frame."""
+    if mode == b"exec":
+        decoded = [a.decode("utf-8", errors="replace") for a in args]
+        result = subprocess.run(decoded)
+        return result.returncode
+    elif mode == b"sh":
+        shell_cmd = args[0].decode("utf-8", errors="replace")
+        result = subprocess.run(shell_cmd, shell=True)
+        return result.returncode
+    else:
+        print(f"sicd: unknown mode {mode!r}", file=sys.stderr)
+        return 1
+
+
+def main():
+    buf = sys.stdin.buffer.read()
+    mode = None
+    fields = []
+    frames_processed = 0
+
+    while True:
+        item = read_netstring(buf)
+        if item is None:
+            break
+        field, buf = item
+
+        if mode is None:
+            mode = field                     # first field = mode selector
+        elif field == b"":
+            if mode is not None:
+                run_frame(mode, fields)
+                frames_processed += 1
+            mode = None
+            fields = []
+        else:
+            fields.append(field)
+
+    return 0 if frames_processed > 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
