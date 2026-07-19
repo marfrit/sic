@@ -11,9 +11,9 @@
 //
 // Examples:
 //
-//	sic quotesu echo hello world
-//	sic quotesu touch 'a b'         # ONE file, not two
-//	sic --sh quotesu 'echo hi | wc -c'
+//	sic host1 echo hello world
+//	sic host1 touch 'a b'         # ONE file, not two
+//	sic --sh host1 'echo hi | wc -c'
 package main
 
 import (

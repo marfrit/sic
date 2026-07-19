@@ -44,10 +44,10 @@ sic <host> -- <command> [arg ...]      # explicit separator
 ```
 
 ```
-sic quotesu echo hello world
-sic quotesu touch 'a b'                # one file named "a b"
-sic quotesu echo '$HOME'               # literal, no expansion
-sic --sh quotesu 'echo hi | wc -c'
+sic host1 echo hello world
+sic host1 touch 'a b'                # one file named "a b"
+sic host1 echo '$HOME'               # literal, no expansion
+sic --sh host1 'echo hi | wc -c'
 ```
 
 ## Build

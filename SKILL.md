@@ -22,11 +22,11 @@ Pass each argument as a separate argument to `sic`. Do not construct netstrings;
 `sic` frames them.
 
 ```
-sic quotesu echo hello world
-sic quotesu touch 'my file.txt'
-sic quotesu echo '$HOME'                                  # literal, no expansion
-sic quotesu python3 -c 'import sys; print(sys.argv)' a 'b c'
-sic --sh quotesu 'grep foo *.log | wc -l'
+sic host1 echo hello world
+sic host1 touch 'my file.txt'
+sic host1 echo '$HOME'                                  # literal, no expansion
+sic host1 python3 -c 'import sys; print(sys.argv)' a 'b c'
+sic --sh host1 'grep foo *.log | wc -l'
 ```
 
 ## exec vs --sh
