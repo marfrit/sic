@@ -7,6 +7,7 @@
 #
 #   lmcp-tool list                              # DISCOVERY: available tools + descriptions
 #   lmcp-tool <tool> key=value [key=value ...]  # args as pairs — NO json-in-shell (apostrophe-safe)
+#   lmcp-tool fetch_url https://example.com       # a bare http(s):// arg is auto-mapped to url=
 #   lmcp-tool <tool> '{"k":"v"}'                # raw JSON (single arg starting with '{')
 #
 # Prefer key=value: `sic host lmcp-tool web_search "query=today's news"` — an apostrophe
@@ -59,7 +60,16 @@ elif [ $# -eq 1 ] && [ "${1#\{}" != "$1" ]; then
     args="$1"                                   # single arg starting with '{' = raw JSON
 else
     args=$(python3 -c 'import sys, json
-print(json.dumps({a.partition("=")[0]: a.partition("=")[2] for a in sys.argv[1:]}))' "$@") \
+args = {}
+for a in sys.argv[1:]:
+    if "=" in a:
+        k, _, v = a.partition("=")
+        args[k] = v
+    elif a.startswith(("http://", "https://")):
+        args["url"] = a          # bare URL -> url= (agents keep passing it positionally)
+    else:
+        args[a] = ""
+print(json.dumps(args))' "$@") \
         || { echo "lmcp-tool: could not build args from key=value pairs" >&2; exit 2; }
 fi
 
