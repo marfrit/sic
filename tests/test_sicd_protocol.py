@@ -140,3 +140,28 @@ def test_empty_payload_command_gets_immediate_eof():
     r = run_sicd(frame(b"cat", b""))
     assert r.returncode == 0, f"expected exit 0, got {r.returncode}, stderr={r.stderr!r}"
     assert r.stdout == b""
+
+def test_large_payload_64k_plus_1_no_deadlock():
+    """Payload+trailing exceeding the 64 KiB pipe buffer must not deadlock.
+    The child reads from stdin, so the parent must pump through a pipe
+    after fork — not pre-write the entire blob into a pipe and block."""
+    body = bytes(range(256)) * 257  # 65,792 bytes > 65,536 pipe buffer
+    r = run_sicd(frame(b"cat", b"") + body)
+    assert r.returncode == 0, f"expected exit 0, got {r.returncode}, stderr={r.stderr!r}"
+    assert len(r.stdout) == len(body), f"expected {len(body)} bytes, got {len(r.stdout)}"
+
+
+def test_multi_mib_payload_no_deadlock():
+    """1 MiB body after an empty-payload frame must stream through without
+    hanging or truncating — pins the streaming pump loop, not just the
+    pipe-buffer edge."""
+    body = bytes(range(256)) * 4096  # 1 MiB
+    r = run_sicd(frame(b"cat", b"") + body)
+    assert r.returncode == 0, f"expected exit 0, got {r.returncode}, stderr={r.stderr!r}"
+    assert r.stdout == body
+
+
+def test_nonexistent_command_exits_nonzero():
+    """Exec of a command that does not exist must not hang or exit 0."""
+    r = run_sicd(frame(b"__nonexistent_command_42__", b""))
+    assert r.returncode != 0, f"expected non-zero exit, got {r.returncode}"
