@@ -165,3 +165,104 @@ def test_nonexistent_command_exits_nonzero():
     """Exec of a command that does not exist must not hang or exit 0."""
     r = run_sicd(frame(b"__nonexistent_command_42__", b""))
     assert r.returncode != 0, f"expected non-zero exit, got {r.returncode}"
+
+
+# ---------------------------------------------------------------------------
+# Fault injection: deterministic EPIPE and short-write coverage.
+#
+# sicd runs under a tiny driver that patches os primitives *before* executing
+# gateway/sicd, instead of racing signals against the pump loop:
+#
+#   widow-before-write : os.fork is wrapped so the parent blocks (waitid with
+#                        WNOWAIT -- the child stays reapable for the later
+#                        waitpid) until the child is dead.  Exec'ing a
+#                        nonexistent command therefore guarantees the pipe is
+#                        widowed before the payload write: the EPIPE case,
+#                        made deterministic.
+#   short-write        : os.write is wrapped to transfer at most 7 bytes per
+#                        call -- the kernel's partial-write behaviour on
+#                        signal interruption.  Code that ignores os.write's
+#                        return value truncates; a write-all loop is
+#                        unaffected.
+# ---------------------------------------------------------------------------
+
+DRIVER = """\
+import os
+import sys
+
+sicd_path = sys.argv[1]
+mode = sys.argv[2]
+
+if mode == "short-write":
+    real_write = os.write
+    def short_write(fd, data):
+        return real_write(fd, bytes(data)[:7])
+    os.write = short_write
+elif mode == "widow-before-write":
+    real_fork = os.fork
+    def fork_then_wait_for_child_death(*args):
+        pid = real_fork(*args)
+        if pid:
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+        return pid
+    os.fork = fork_then_wait_for_child_death
+else:
+    raise SystemExit("unknown fault mode: " + mode)
+
+sys.argv = [sicd_path]
+code = compile(open(sicd_path, "rb").read(), sicd_path, "exec")
+exec(code, {"__name__": "__main__", "__file__": sicd_path})
+"""
+
+
+def run_sicd_fault(wire: bytes, mode: str, tmp_path) -> subprocess.CompletedProcess:
+    driver = tmp_path / "fault_driver.py"
+    driver.write_text(DRIVER)
+    try:
+        return subprocess.run(
+            [sys.executable, str(driver), SICD, mode],
+            input=wire,
+            capture_output=True,
+            timeout=TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"sicd hung under fault mode {mode!r}")
+
+
+def test_epipe_child_dead_before_payload_write_no_traceback(tmp_path):
+    """Child is guaranteed dead (nonexistent command; the wrapped fork waits
+    for the corpse) before the parent writes the payload: sicd must handle
+    EPIPE and exit with the child's status -- never dump a BrokenPipeError
+    traceback on stderr."""
+    wire = frame(b"__nonexistent_command_42__", b"payload for a corpse\n")
+    r = run_sicd_fault(wire, "widow-before-write", tmp_path)
+    assert b"Traceback" not in r.stderr, (
+        f"unhandled exception instead of clean EPIPE handling:\n"
+        f"{r.stderr.decode(errors='replace')}"
+    )
+    assert b"BrokenPipeError" not in r.stderr
+    assert r.returncode == 1, f"expected the child's exit status 1, got {r.returncode}"
+
+
+def test_partial_write_payload_not_truncated(tmp_path):
+    """os.write may transfer fewer bytes than requested; the payload write
+    must loop on its return value.  With every write capped at 7 bytes, cat
+    must still receive the full 37-byte payload, not just the first chunk."""
+    payload = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\n"
+    r = run_sicd_fault(frame(b"cat", payload), "short-write", tmp_path)
+    assert r.returncode == 0, f"expected exit 0, got {r.returncode}, stderr={r.stderr!r}"
+    assert r.stdout == payload, (
+        f"payload truncated by ignored os.write return value: "
+        f"got {len(r.stdout)} of {len(payload)} bytes"
+    )
+
+
+def test_partial_write_pump_loop_not_truncated(tmp_path):
+    """The same 7-byte write cap applied to the stdin pump loop: an 8 KiB
+    trailing body must reach the child intact, not 7 bytes per read chunk."""
+    body = bytes(range(256)) * 32  # 8 KiB
+    r = run_sicd_fault(frame(b"cat", b"") + body, "short-write", tmp_path)
+    assert r.returncode == 0, f"expected exit 0, got {r.returncode}, stderr={r.stderr!r}"
+    assert r.stdout == body, (
+        f"pump loop truncated trailing stdin: got {len(r.stdout)} of {len(body)} bytes"
+    )

@@ -38,6 +38,13 @@ def parse_netstring(data: bytes) -> tuple[bytes, bytes]:
     return content, rest
 
 
+def write_all(fd: int, data: bytes) -> None:
+    """Write all bytes to fd, looping on short writes."""
+    while data:
+        n = os.write(fd, data)
+        data = data[n:]
+
+
 def main() -> None:
     # Read 5-byte preamble: magic + len32
     try:
@@ -105,14 +112,25 @@ def main() -> None:
         # Parent
         os.close(r_fd)
         # Write payload first
-        os.write(w_fd, payload)
+        try:
+            write_all(w_fd, payload)
+        except BrokenPipeError:
+            # Child died before we could write payload; reap and inherit its status
+            os.close(w_fd)
+            _, status = os.waitpid(pid, 0)
+            if os.WIFEXITED(status):
+                sys.exit(os.WEXITSTATUS(status))
+            else:
+                sys.exit(1)
         # Then pump remaining stdin to child
         try:
             while True:
                 chunk = os.read(sys.stdin.fileno(), 65536)
                 if not chunk:
                     break
-                os.write(w_fd, chunk)
+                write_all(w_fd, chunk)
+        except BrokenPipeError:
+            pass
         except OSError:
             pass
         os.close(w_fd)
