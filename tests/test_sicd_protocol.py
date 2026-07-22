@@ -27,6 +27,7 @@ Semantics each sicd MUST implement:
 sicd inherits the child's exit status on success paths.
 """
 
+import signal
 import struct
 import subprocess
 import sys
@@ -184,6 +185,13 @@ def test_nonexistent_command_exits_nonzero():
 #                        signal interruption.  Code that ignores os.write's
 #                        return value truncates; a write-all loop is
 #                        unaffected.
+#   stdin-read-eio     : os.read is wrapped so that pump-loop-sized reads
+#                        (> 4096 bytes) on sicd's OWN stdin (fd 0) raise
+#                        OSError(EIO).  Frame parsing (small exact reads)
+#                        succeeds; the first pump read then fails the way a
+#                        dying tty / revoked fd fails.  A bare
+#                        `except OSError: pass` turns this into silent
+#                        truncation.
 # ---------------------------------------------------------------------------
 
 DRIVER = """\
@@ -206,6 +214,14 @@ elif mode == "widow-before-write":
             os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
         return pid
     os.fork = fork_then_wait_for_child_death
+elif mode == "stdin-read-eio":
+    import errno
+    real_read = os.read
+    def eio_read(fd, n):
+        if fd == 0 and n > 4096:
+            raise OSError(errno.EIO, "Input/output error")
+        return real_read(fd, n)
+    os.read = eio_read
 else:
     raise SystemExit("unknown fault mode: " + mode)
 
@@ -265,4 +281,76 @@ def test_partial_write_pump_loop_not_truncated(tmp_path):
     assert r.returncode == 0, f"expected exit 0, got {r.returncode}, stderr={r.stderr!r}"
     assert r.stdout == body, (
         f"pump loop truncated trailing stdin: got {len(r.stdout)} of {len(body)} bytes"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Exit-status fidelity: signal death and read-side errors must be visible.
+#
+# Tracked gaps from 7f7f0c2: both waitpid sites collapse WIFSIGNALED to
+# exit 1, and the pump loop's bare `except OSError: pass` swallows read
+# errors on sicd's own stdin as silent truncation.
+# ---------------------------------------------------------------------------
+
+
+def _selfkill_command(tmp_path, signum: int) -> bytes:
+    """A command (no spaces in any argv element) whose process kills itself
+    with signum before producing any output."""
+    script = tmp_path / f"selfkill_{signum}.py"
+    script.write_text(f"import os\nos.kill(os.getpid(), {signum})\n")
+    return f"{sys.executable} {script}".encode()
+
+
+@pytest.mark.parametrize(
+    "signum,expected",
+    [
+        pytest.param(signal.SIGKILL, 137, id="SIGKILL-137"),
+        pytest.param(signal.SIGTERM, 143, id="SIGTERM-143"),
+    ],
+)
+def test_signal_killed_child_exits_128_plus_termsig(tmp_path, signum, expected):
+    """A child killed by a signal must surface as exit 128+WTERMSIG (shell
+    convention), NOT collapse to exit 1 -- exit 1 is indistinguishable from
+    an ordinary command failure, so the caller cannot tell a crashed/killed
+    command from one that merely returned false."""
+    r = run_sicd(frame(_selfkill_command(tmp_path, signum), b""))
+    assert r.returncode == expected, (
+        f"child died from signal {signum}; expected exit {expected} "
+        f"(128+WTERMSIG), got {r.returncode} -- signal death collapsed "
+        f"into an ordinary failure code"
+    )
+
+
+def test_signal_killed_child_epipe_path_exits_128_plus_termsig(tmp_path):
+    """Same contract on the EPIPE recovery path: the child is provably dead
+    from SIGKILL before the parent writes the payload (widowed pipe), and the
+    status inherited there must also be 128+WTERMSIG, not 1."""
+    wire = frame(_selfkill_command(tmp_path, int(signal.SIGKILL)), b"payload for a corpse\n")
+    r = run_sicd_fault(wire, "widow-before-write", tmp_path)
+    assert b"Traceback" not in r.stderr, r.stderr.decode(errors="replace")
+    assert r.returncode == 137, (
+        f"expected exit 137 (128+SIGKILL) via the EPIPE path, got {r.returncode}"
+    )
+
+
+def test_stdin_read_oserror_is_diagnosed_not_swallowed(tmp_path):
+    """OSError on reading sicd's OWN stdin (EIO here; EBADF, ENXIO likewise)
+    is not `| head` semantics -- only BrokenPipeError on the write side is.
+    Today `except OSError: pass` silently drops the rest of the stream and
+    exits 0 as if the transfer completed.  Required: a diagnostic on stderr
+    (a handled message, not a traceback) and a non-zero exit, so truncation
+    is never reported as success."""
+    payload = b"payload written before the fault\n"
+    trailing = b"trailing bytes the pump loop will never deliver" * 200
+    r = run_sicd_fault(frame(b"cat", payload) + trailing, "stdin-read-eio", tmp_path)
+    assert r.returncode != 0, (
+        "stdin read failed mid-stream (EIO) but sicd exited 0 -- "
+        "silent truncation reported as success"
+    )
+    assert r.stderr.strip() != b"", (
+        "stdin read failed mid-stream but no diagnostic was written to stderr"
+    )
+    assert b"Traceback" not in r.stderr, (
+        f"want a handled diagnostic, not an unhandled exception:\n"
+        f"{r.stderr.decode(errors='replace')}"
     )
