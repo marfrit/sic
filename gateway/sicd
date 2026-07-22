@@ -113,6 +113,10 @@ def main() -> None:
                     break
                 write_all(w_fd, chunk)
         except BrokenPipeError:
+            # CPython sets SIGPIPE to SIG_IGN at startup, so EPIPE surfaces
+            # as BrokenPipeError instead of killing the process. A port to
+            # another language (Go, etc.) must replicate this explicitly or
+            # the EPIPE path silently becomes a SIGPIPE death.
             pass
         except OSError as e:
             sys.stderr.write(f"sicd: stdin read error: {e}\n")
