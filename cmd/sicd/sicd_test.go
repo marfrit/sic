@@ -299,7 +299,6 @@ func TestMalformedInputExits1WithDiagnostic(t *testing.T) {
 	}{
 		{"empty-input", nil},
 		{"missing-magic", []byte("garbage with no magic byte")},
-		{"old-v1-frame-without-preamble", []byte("4:exec,3:cat,0:,")},
 		{"body-not-a-netstring", concat([]byte{0x00}, be32(14), []byte("not&a netstrng"))},
 		{"truncated-declared-length", concat([]byte{0x00}, be32(100), netstring([]byte("cat\x00hi")))},
 		{"content-missing-nul-truncated", concat([]byte{0x00}, be32(6), netstring([]byte("ca")))},

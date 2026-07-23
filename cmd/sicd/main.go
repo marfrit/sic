@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -44,6 +46,39 @@ func readNetstring(buf []byte) ([]byte, bool) {
 	return buf[start:end], true
 }
 
+// readNetstringStream reads ONE djb netstring (<len>:<bytes>,) from a stream (unlike
+// readNetstring, which parses a single fully-buffered frame). ok=false on EOF or malformed
+// framing (non-digit length, short body, missing comma, length > 1<<24). Used by the v1 path,
+// which is a SEQUENCE of netstrings terminated by the empty netstring 0:,.
+func readNetstringStream(r *bufio.Reader) ([]byte, bool) {
+	lenStr, err := r.ReadString(':')
+	if err != nil {
+		return nil, false // EOF before ':' — truncated
+	}
+	lenStr = lenStr[:len(lenStr)-1] // drop the ':'
+	if len(lenStr) == 0 {
+		return nil, false
+	}
+	for i := 0; i < len(lenStr); i++ {
+		if lenStr[i] < '0' || lenStr[i] > '9' {
+			return nil, false
+		}
+	}
+	n, err := strconv.Atoi(lenStr)
+	if err != nil || n > 1<<24 {
+		return nil, false
+	}
+	content := make([]byte, n)
+	if _, err := io.ReadFull(r, content); err != nil {
+		return nil, false
+	}
+	comma, err := r.ReadByte()
+	if err != nil || comma != ',' {
+		return nil, false
+	}
+	return content, true
+}
+
 func waitForChild(cmd *exec.Cmd) int {
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -61,16 +96,30 @@ func waitForChild(cmd *exec.Cmd) int {
 func main() {
 	signal.Ignore(syscall.SIGPIPE)
 
-	magic := make([]byte, 1)
-	if _, err := io.ReadFull(os.Stdin, magic); err != nil {
-		fmt.Fprintf(os.Stderr, "sicd: read magic: %v\n", err)
+	// Dual-read dispatch on the FIRST byte, so a v2 daemon can be deployed without bricking the
+	// v1 clients still in the field: 0x00 = the v2 preamble; an ASCII digit = the first byte of
+	// a v1 netstring length (legacy, no preamble); anything else is malformed.
+	first := make([]byte, 1)
+	if _, err := io.ReadFull(os.Stdin, first); err != nil {
+		fmt.Fprintf(os.Stderr, "sicd: read first byte: %v\n", err)
 		os.Exit(1)
 	}
-	if magic[0] != 0x00 {
-		fmt.Fprintf(os.Stderr, "sicd: invalid magic byte: 0x%02x\n", magic[0])
+	switch {
+	case first[0] == 0x00:
+		runV2() // magic consumed; the rest (len32 + netstring + trailing) is on stdin
+	case first[0] >= '0' && first[0] <= '9':
+		// The byte we consumed for dispatch is the first digit of the first netstring's
+		// length — push it back before parsing.
+		runV1(bufio.NewReader(io.MultiReader(bytes.NewReader(first), os.Stdin)))
+	default:
+		fmt.Fprintf(os.Stderr, "sicd: invalid first byte: 0x%02x\n", first[0])
 		os.Exit(1)
 	}
+}
 
+// runV2 is the v2 wire path (magic already consumed by main): 4-byte big-endian length, one
+// netstring whose content is <command> 0x00 <payload>, then trailing stdin forwarded to the child.
+func runV2() {
 	lenBytes := make([]byte, 4)
 	if _, err := io.ReadFull(os.Stdin, lenBytes); err != nil {
 		fmt.Fprintf(os.Stderr, "sicd: read length: %v\n", err)
@@ -133,6 +182,66 @@ func main() {
 	}
 
 	os.Exit(pumpStdin(stdinPipe, os.Stdin, func() int { return waitForChild(cmd) }, os.Stderr))
+}
+
+// runV1 handles the legacy v1 wire the deployed cmd/sic still sends (raw netstrings, no
+// preamble): first netstring = mode ("exec" | "sh"); then the argv/command netstrings;
+// terminated by the empty netstring 0:,. Everything after the terminator is the child's stdin.
+// Kept only for the migration window so a v2 daemon does not reject v1 callers.
+func runV1(r *bufio.Reader) {
+	modeB, ok := readNetstringStream(r)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "sicd: v1 malformed frame (mode)\n")
+		os.Exit(1)
+	}
+	mode := string(modeB)
+	if mode != "exec" && mode != "sh" {
+		fmt.Fprintf(os.Stderr, "sicd: v1 unknown mode %q\n", mode)
+		os.Exit(1)
+	}
+
+	// Read argv/command netstrings until the empty-netstring terminator. EOF first = truncated.
+	var argv []string
+	for {
+		ns, ok := readNetstringStream(r)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "sicd: v1 truncated frame (no 0:, terminator)\n")
+			os.Exit(1)
+		}
+		if len(ns) == 0 {
+			break // the empty netstring 0:, terminates the frame
+		}
+		argv = append(argv, string(ns))
+	}
+
+	var cmd *exec.Cmd
+	switch mode {
+	case "exec":
+		if len(argv) == 0 {
+			fmt.Fprintf(os.Stderr, "sicd: v1 empty exec argv\n")
+			os.Exit(1)
+		}
+		cmd = exec.Command(argv[0], argv[1:]...) // each netstring is ONE argv element, never space-split
+	case "sh":
+		cmd = exec.Command("sh", "-c", strings.Join(argv, " "))
+	}
+
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sicd: create stdin pipe: %v\n", err)
+		os.Exit(1)
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "sicd: exec: %v\n", err)
+		os.Exit(1)
+	}
+
+	// v1 has no framed payload: everything after 0:, (still buffered in r + the rest of stdin)
+	// is the child's stdin. Reuse the v2 pump so EPIPE/reap/exit-status semantics match exactly.
+	os.Exit(pumpStdin(stdinPipe, r, func() int { return waitForChild(cmd) }, os.Stderr))
 }
 
 // pumpStdin copies src (sicd's own stdin) into the child's stdin (dst), closes dst so the
