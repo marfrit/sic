@@ -50,6 +50,13 @@ def frame(command: bytes, payload: bytes) -> bytes:
     return b"\x00" + struct.pack(">I", len(ns)) + ns
 
 
+def raw_frame(ns: bytes) -> bytes:
+    """Wrap an already-built (possibly malformed) netstring in a valid
+    preamble. Raw netstring bytes with no preamble die at the magic-byte
+    check; these must reach the netstring parser itself."""
+    return b"\x00" + struct.pack(">I", len(ns)) + ns
+
+
 def run_sicd(wire: bytes) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
@@ -124,6 +131,18 @@ def test_bare_double_dash_payload_is_opaque(payload):
         pytest.param(b"\x00" + struct.pack(">I", 14) + b"not&a netstrng", id="body-not-a-netstring"),
         pytest.param(b"\x00" + struct.pack(">I", 100) + netstring(b"cat\x00hi"), id="truncated-declared-length"),
         pytest.param(b"\x00" + struct.pack(">I", 6) + netstring(b"ca"), id="content-missing-nul-separator"),
+        # netstring length must be ALL digits: strconv-style parsers accept a
+        # leading "+" and would exec `cat` with payload "hi".
+        pytest.param(raw_frame(b"+" + netstring(b"cat\x00hi")), id="plus-prefixed-length"),
+        # declared content length (1<<24)+1 exceeds the sanity cap; a parser
+        # without the cap execs `cat` with a ~16 MiB payload.
+        pytest.param(
+            raw_frame(netstring(b"cat\x00" + b"x" * ((1 << 24) + 1 - 4))),
+            id="length-exceeds-sanity-cap",
+        ),
+        # bytes after the netstring's closing comma (still inside len32) must
+        # be rejected, not silently discarded while `cat` runs.
+        pytest.param(raw_frame(netstring(b"cat\x00hello") + b"JUNK"), id="trailing-data-after-comma"),
     ],
 )
 def test_malformed_input_exits_1_with_diagnostic(wire):

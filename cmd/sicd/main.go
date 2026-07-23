@@ -18,13 +18,27 @@ func readNetstring(buf []byte) ([]byte, []byte, bool) {
 	if i < 0 {
 		return nil, nil, false
 	}
+	// Reject non-digit characters (including leading '+' or '-')
+	for _, c := range buf[:i] {
+		if c < '0' || c > '9' {
+			return nil, nil, false
+		}
+	}
 	n, err := strconv.Atoi(string(buf[:i]))
 	if err != nil || n < 0 {
+		return nil, nil, false
+	}
+	// Sanity cap: reject lengths > 1<<24
+	if n > 1<<24 {
 		return nil, nil, false
 	}
 	start := i + 1
 	end := start + n
 	if len(buf) < end+1 || buf[end] != ',' {
+		return nil, nil, false
+	}
+	// Reject trailing data after the netstring's closing comma
+	if len(buf) > end+1 {
 		return nil, nil, false
 	}
 	return buf[start:end], buf[end+1:], true
@@ -125,6 +139,7 @@ func main() {
 	if _, err := io.Copy(stdinPipe, os.Stdin); err != nil && !errors.Is(err, syscall.EPIPE) {
 		fmt.Fprintf(os.Stderr, "sicd: forward stdin: %v\n", err)
 		stdinPipe.Close()
+		waitForChild(cmd)
 		os.Exit(1)
 	}
 	stdinPipe.Close()
