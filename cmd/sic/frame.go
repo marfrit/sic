@@ -28,3 +28,8 @@ func v2Frame(command []byte, payload []byte) []byte {
 
 	return frame
 }
+
+// wrapHop wraps an already-built inner frame for one chain hop.
+func wrapHop(verb string, inner []byte) []byte {
+	return v2Frame([]byte(verb+" sicd"), inner)
+}
