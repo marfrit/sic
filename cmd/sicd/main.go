@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 func readNetstring(buf []byte) ([]byte, bool) {
@@ -344,14 +345,47 @@ func runV1(r *bufio.Reader) {
 // os.read to raise OSError), since no real fd on this platform yields a read error on stdin
 // (a pty slave and a socket peer both see a clean kernel EOF on hangup, in Go AND CPython).
 func pumpStdin(dst io.WriteCloser, src io.Reader, reap func() int, errOut io.Writer) int {
-	_, err := io.Copy(dst, src)
-	dst.Close()
-	if err != nil && !errors.Is(err, syscall.EPIPE) {
-		fmt.Fprintf(errOut, "sicd: forward stdin: %v\n", err)
-		reap()
-		return 1
+	// Race the stdin copy against the child's exit. The old code did io.Copy THEN reap, so a
+	// client that never closes its stdin (holds the ssh channel open with no bytes) kept the
+	// copy blocked on the READ long after the child had exited — sicd never reaped, ssh never
+	// returned, the whole call hung until stdin EOF or a timeout. Now: whichever ends first wins.
+	copyDone := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(dst, src)
+		dst.Close() // a still-reading child sees EOF
+		copyDone <- err
+	}()
+	childExited := make(chan int, 1)
+	go func() { childExited <- reap() }()
+
+	select {
+	case err := <-copyDone:
+		// The stdin transfer concluded (EOF / EPIPE / error) — its outcome is meaningful.
+		if err != nil && !errors.Is(err, syscall.EPIPE) {
+			// A genuine read error truncated the transfer to a still-live child -> failure,
+			// regardless of the child's own eventual status (the child cannot tell a truncated
+			// EOF from a clean one).
+			fmt.Fprintf(errOut, "sicd: forward stdin: %v\n", err)
+			<-childExited
+			return 1
+		}
+		return <-childExited
+	case status := <-childExited:
+		// The child exited BEFORE the copy finished: it did not need the rest of stdin (e.g. a
+		// command that ignores stdin, like `true`). Stop forwarding — abandon the (possibly
+		// blocked) read. This is the hang fix. Still honour a truncation the child DID care
+		// about if the copy is finishing this very instant, but bound the wait so a genuinely
+		// blocked stdin cannot re-introduce the hang.
+		select {
+		case err := <-copyDone:
+			if err != nil && !errors.Is(err, syscall.EPIPE) {
+				fmt.Fprintf(errOut, "sicd: forward stdin: %v\n", err)
+				return 1
+			}
+		case <-time.After(50 * time.Millisecond):
+		}
+		return status
 	}
-	return reap()
 }
 
 func writeAll(w io.Writer, data []byte) error {

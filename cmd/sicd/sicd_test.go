@@ -591,6 +591,28 @@ func TestPumpStdinEpipeIsHeadSemanticsReturnsChildStatus(t *testing.T) {
 	}
 }
 
+// blockingReader.Read blocks forever — models a client that holds its stdin open and never
+// sends EOF (exactly how the Bash tool invokes sic non-interactively).
+type blockingReader struct{}
+
+func (blockingReader) Read([]byte) (int, error) { select {} }
+
+func TestPumpStdinReturnsOnChildExitDespiteBlockedStdin(t *testing.T) {
+	// Regression for the fleet-wide hang: a never-EOFing stdin must NOT keep sicd blocked in the
+	// copy after the child has exited. pumpStdin must return the child's status promptly.
+	dst := &errWriteCloser{}
+	done := make(chan int, 1)
+	go func() { done <- pumpStdin(dst, blockingReader{}, func() int { return 7 }, io.Discard) }()
+	select {
+	case code := <-done:
+		if code != 7 {
+			t.Fatalf("expected the child's status 7, got %d", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pumpStdin hung on a never-EOFing stdin after the child exited (the bug)")
+	}
+}
+
 func TestPumpStdinCleanEofReturnsChildStatus(t *testing.T) {
 	src := bytes.NewReader([]byte("all of the stdin, cleanly"))
 	dst := &errWriteCloser{}
