@@ -43,3 +43,21 @@ func verbFor(runtime, name string) (string, error) {
 		return "", fmt.Errorf("unknown runtime: %s", runtime)
 	}
 }
+
+func resolveVerbs(hops []string, nest []string) ([]string, error) {
+	if len(hops) > len(nest) {
+		return nil, fmt.Errorf("too many hops for this host's nest depth")
+	}
+	if len(hops) == 0 {
+		return []string{}, nil
+	}
+	verbs := make([]string, len(hops))
+	for i, hop := range hops {
+		verb, err := verbFor(nest[i], hop)
+		if err != nil {
+			return nil, err
+		}
+		verbs[i] = verb
+	}
+	return verbs, nil
+}
