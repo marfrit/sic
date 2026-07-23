@@ -457,18 +457,13 @@ func TestFramingAndPumpSurviveTrickledStdin(t *testing.T) {
 }
 
 func TestStdinReadErrorDiagnosedNotSwallowed(t *testing.T) {
-	t.Skip("unsatisfiable in Go, and the premise is a Python-ism. The original fault injection " +
-		"(open a pty, close the master mid-pump) assumed a hung-up read returns EIO, as CPython's " +
-		"os.read() does. Go's runtime poller instead translates the hang-up to a clean EOF " +
-		"(probed: slave.Read -> io.EOF, io.Copy -> nil; a socketpair peer close is EOF too, since " +
-		"SO_LINGER/RST is TCP-only and AF_UNIX close delivers EOF). No fd mechanism available to a " +
-		"test produces a distinguishable READ error on sicd's stdin. This is not a gap in main.go: " +
-		"sicd's trailing stdin is UNFRAMED by design, so a truncated source and a clean end are " +
-		"both EOF and cannot be told apart — the pump treats EOF as a legitimate end (correct) and " +
-		"already reaps-then-exits-nonzero on a genuine non-EPIPE error, which simply does not arise " +
-		"via pty/socket close in Go. Two models burned 20+ grind attempts here before the premise " +
-		"was probed. Proper coverage = refactor the pump into a unit-testable func driven by an " +
-		"io.Reader that returns a non-EOF error.")
+	t.Skip("no real fd yields a read error on sicd's stdin on this platform, so this " +
+		"integration-style injection is unsatisfiable — a pty slave and a socket peer both see a " +
+		"clean KERNEL EOF on hangup (probed: raw syscall.Read -> n=0, errno=0), identically in Go " +
+		"and CPython; EIO-after-hangup is master-side, not slave-side. The Python reference does " +
+		"NOT use a pty here — it monkeypatches os.read to raise OSError(EIO). The Go equivalent is " +
+		"a mock erroring io.Reader, which now covers the reap-then-exit-nonzero branch as a UNIT " +
+		"test (TestPumpStdin*). This black-box test is kept only as a placeholder for that contract.")
 }
 
 // --- pty plumbing (Linux) ----------------------------------------------------
@@ -517,4 +512,82 @@ func openPty(t *testing.T) (master, slave *os.File) {
 		t.Fatalf("TCSETS: %v", err)
 	}
 	return master, slave
+}
+
+// erroringReader yields data once, then err — the Go translation of the Python reference's
+// fault injection (monkeypatching os.read to raise OSError). Lets us cover pumpStdin's
+// read-error branch without an fd, since no real fd produces a read error on stdin here.
+type erroringReader struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (r *erroringReader) Read(p []byte) (int, error) {
+	if !r.done && len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		if len(r.data) == 0 {
+			r.done = true
+		}
+		return n, nil
+	}
+	return 0, r.err
+}
+
+type errWriteCloser struct {
+	buf      bytes.Buffer
+	writeErr error // if set, Write returns it (e.g. EPIPE from a widowed pipe)
+	closed   bool
+}
+
+func (w *errWriteCloser) Write(p []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return w.buf.Write(p)
+}
+func (w *errWriteCloser) Close() error { w.closed = true; return nil }
+
+func TestPumpStdinReapsAndExitsNonzeroOnReadError(t *testing.T) {
+	src := &erroringReader{data: []byte("partial payload"), err: syscall.EIO}
+	dst := &errWriteCloser{}
+	reaped := false
+	var errOut bytes.Buffer
+	code := pumpStdin(dst, src, func() int { reaped = true; return 0 }, &errOut)
+	if code != 1 {
+		t.Fatalf("a genuine read error must exit non-zero regardless of child status, got %d", code)
+	}
+	if !reaped {
+		t.Fatal("the child must still be reaped on a read error (no zombie)")
+	}
+	if !dst.closed {
+		t.Fatal("the child's stdin must be closed so it sees EOF")
+	}
+	if !bytes.Contains(errOut.Bytes(), []byte("forward stdin")) {
+		t.Fatalf("a diagnostic must be written, got: %q", errOut.String())
+	}
+}
+
+func TestPumpStdinEpipeIsHeadSemanticsReturnsChildStatus(t *testing.T) {
+	// EPIPE from the write side = the child stopped reading (`| head`) — NOT an error.
+	src := &erroringReader{data: []byte("x"), err: io.EOF} // clean src; the write side EPIPEs
+	dst := &errWriteCloser{writeErr: syscall.EPIPE}
+	var errOut bytes.Buffer
+	code := pumpStdin(dst, src, func() int { return 42 }, &errOut)
+	if code != 42 {
+		t.Fatalf("EPIPE is head-semantics; must return the child's own status 42, got %d", code)
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("EPIPE must not emit a diagnostic, got: %q", errOut.String())
+	}
+}
+
+func TestPumpStdinCleanEofReturnsChildStatus(t *testing.T) {
+	src := bytes.NewReader([]byte("all of the stdin, cleanly"))
+	dst := &errWriteCloser{}
+	code := pumpStdin(dst, src, func() int { return 7 }, io.Discard)
+	if code != 7 {
+		t.Fatalf("a clean EOF is a legitimate end; must return the child's status 7, got %d", code)
+	}
 }

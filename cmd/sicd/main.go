@@ -13,35 +13,35 @@ import (
 	"syscall"
 )
 
-func readNetstring(buf []byte) ([]byte, []byte, bool) {
+func readNetstring(buf []byte) ([]byte, bool) {
 	i := bytes.IndexByte(buf, ':')
 	if i < 0 {
-		return nil, nil, false
+		return nil, false
 	}
 	// Reject non-digit characters (including leading '+' or '-')
 	for _, c := range buf[:i] {
 		if c < '0' || c > '9' {
-			return nil, nil, false
+			return nil, false
 		}
 	}
 	n, err := strconv.Atoi(string(buf[:i]))
 	if err != nil || n < 0 {
-		return nil, nil, false
+		return nil, false
 	}
 	// Sanity cap: reject lengths > 1<<24
 	if n > 1<<24 {
-		return nil, nil, false
+		return nil, false
 	}
 	start := i + 1
 	end := start + n
 	if len(buf) < end+1 || buf[end] != ',' {
-		return nil, nil, false
+		return nil, false
 	}
 	// Reject trailing data after the netstring's closing comma
 	if len(buf) > end+1 {
-		return nil, nil, false
+		return nil, false
 	}
-	return buf[start:end], buf[end+1:], true
+	return buf[start:end], true
 }
 
 func waitForChild(cmd *exec.Cmd) int {
@@ -84,7 +84,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	content, _, ok := readNetstring(nsBuf)
+	content, ok := readNetstring(nsBuf)
 	if !ok {
 		fmt.Fprintf(os.Stderr, "sicd: invalid netstring\n")
 		os.Exit(1)
@@ -132,19 +132,27 @@ func main() {
 		os.Exit(waitForChild(cmd))
 	}
 
-	// Pump remaining stdin to child. EPIPE on the write side means the
-	// child stopped reading (| head semantics) — that is not an error.
-	// Any other error (EIO, etc.) means sicd's own stdin failed mid-stream
-	// and the transfer was truncated — exit non-zero with a diagnostic.
-	if _, err := io.Copy(stdinPipe, os.Stdin); err != nil && !errors.Is(err, syscall.EPIPE) {
-		fmt.Fprintf(os.Stderr, "sicd: forward stdin: %v\n", err)
-		stdinPipe.Close()
-		waitForChild(cmd)
-		os.Exit(1)
-	}
-	stdinPipe.Close()
+	os.Exit(pumpStdin(stdinPipe, os.Stdin, func() int { return waitForChild(cmd) }, os.Stderr))
+}
 
-	os.Exit(waitForChild(cmd))
+// pumpStdin copies src (sicd's own stdin) into the child's stdin (dst), closes dst so the
+// child sees EOF, then reaps. EPIPE from the WRITE side means the child stopped reading
+// (| head semantics) — not an error, so the child's own status is returned. Any OTHER error
+// (a genuine read/write failure) means the transfer was truncated: report a diagnostic, reap
+// to avoid a zombie, and return non-zero REGARDLESS of the child's status — a truncated
+// transfer must never be reported as success. Extracted so a mock erroring io.Reader can
+// cover this branch: that is exactly how the Python reference tests it (monkeypatching
+// os.read to raise OSError), since no real fd on this platform yields a read error on stdin
+// (a pty slave and a socket peer both see a clean kernel EOF on hangup, in Go AND CPython).
+func pumpStdin(dst io.WriteCloser, src io.Reader, reap func() int, errOut io.Writer) int {
+	_, err := io.Copy(dst, src)
+	dst.Close()
+	if err != nil && !errors.Is(err, syscall.EPIPE) {
+		fmt.Fprintf(errOut, "sicd: forward stdin: %v\n", err)
+		reap()
+		return 1
+	}
+	return reap()
 }
 
 func writeAll(w io.Writer, data []byte) error {
