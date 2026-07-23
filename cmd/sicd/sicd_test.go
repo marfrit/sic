@@ -75,9 +75,9 @@ func be32(n uint32) []byte {
 
 // frame builds one wire frame: magic, 4-byte BE length, netstring(command NUL payload).
 func frame(command, payload []byte) []byte {
-	// v2 content = argv netstrings + the empty-netstring terminator 0:, + payload. The command is
-	// split on spaces HERE (test-side convenience); the wire itself no longer space-splits — argv
-	// arrives length-framed so `touch 'a b'` keeps its boundary.
+	// v2 content = netstring(argc) + argc argv netstrings + payload. The command is split on
+	// spaces HERE (test-side convenience) to count args; the wire itself no longer space-splits —
+	// argv arrives length-framed so `touch 'a b'` keeps its boundary.
 	args := bytes.Split(command, []byte(" "))
 	content := netstring([]byte(strconv.Itoa(len(args))))
 	for _, a := range args {
@@ -649,15 +649,28 @@ func TestV2OuterLengthCapRejected(t *testing.T) {
 }
 
 func TestV2FrameElementCapRejected(t *testing.T) {
-	// > maxArgs (4096) argv netstrings in one frame must be rejected, not accumulated.
-	var content []byte
+	// argc over maxArgs (4096) must be rejected at the count check, before any element is read.
+	content := netstring([]byte("5000"))
 	for i := 0; i < 5000; i++ {
 		content = concat(content, netstring([]byte("a")))
 	}
-	content = concat(content, []byte("0:,"))
 	ns := netstring(content)
 	r := runSicd(t, concat([]byte{0x00}, be32(uint32(len(ns))), ns))
 	if r.code != 1 {
 		t.Fatalf("v2 frame over the element cap must exit 1, got %d", r.code)
+	}
+}
+
+func TestV2NonCanonicalArgcRejected(t *testing.T) {
+	// reviewer 964 #2: argc must be canonical decimal. Leading zero, leading '+', and a signed
+	// value are all one-value-two-encodings and must exit 1 (never exec), even though a well-formed
+	// argv follows. strconv.Atoi alone would accept "+1" and "001".
+	for _, bad := range []string{"01", "+1", "-1", " 1", "1 "} {
+		content := concat(netstring([]byte(bad)), netstring([]byte("echo")))
+		ns := netstring(content)
+		r := runSicd(t, concat([]byte{0x00}, be32(uint32(len(ns))), ns))
+		if r.code != 1 {
+			t.Fatalf("non-canonical argc %q must exit 1, got %d (stdout=%q)", bad, r.code, r.stdout)
+		}
 	}
 }

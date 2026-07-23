@@ -48,8 +48,9 @@ func readNetstring(buf []byte) ([]byte, bool) {
 
 // readNetstringStream reads ONE djb netstring (<len>:<bytes>,) from a stream (unlike
 // readNetstring, which parses a single fully-buffered frame). ok=false on EOF or malformed
-// framing (non-digit length, short body, missing comma, length > 1<<24). Used by the v1 path,
-// which is a SEQUENCE of netstrings terminated by the empty netstring 0:,.
+// framing (non-digit length, short body, missing comma, length > 1<<24). Used by BOTH wire
+// paths: v1 (a sequence of netstrings terminated by the empty netstring 0:,) and v2 (the argc
+// count plus each argv netstring, inside parseV2Content).
 func readNetstringStream(r *bufio.Reader) ([]byte, bool) {
 	// Read the length token digit-by-digit with a HARD cap. This must be bounded BEFORE the
 	// value is trusted: bufio.ReadString(':') buffers the whole pre-':' run unbounded, so an
@@ -91,10 +92,14 @@ func readNetstringStream(r *bufio.Reader) ([]byte, bool) {
 	return content, true
 }
 
-// parseV2Content splits a v2 netstring's content into argv (a run of netstrings terminated by
-// the empty netstring 0:,) and the trailing payload. Length-framed argv preserves argument
-// boundaries and lets any byte (space, NUL, 0xFF) appear in an argument; readNetstringStream
-// bounds each element and its length token, so a hostile content cannot OOM here.
+// parseV2Content splits a v2 netstring's content into argv and the trailing payload. Content is
+// netstring(argc) + exactly argc argv netstrings + payload; reading a FIXED count (not an empty-
+// netstring terminator) makes an empty "" a representable argument (reviewer 964 #1). Length-framed
+// argv preserves argument boundaries and lets any byte (space, NUL, 0xFF) appear in an argument;
+// readNetstringStream bounds each element and its length token, so a hostile content cannot OOM.
+// NOTE: payload is simply everything after the argc-th argv netstring, so an argc lying LOW
+// reclassifies the sender's own trailing netstrings as child stdin — only ever the sender's own
+// frame, no trust boundary crossed (reviewer 964 #3).
 func parseV2Content(content []byte) (argv [][]byte, payload []byte, ok bool) {
 	const maxArgs = 4096
 	const maxFrameBytes = 1 << 20
@@ -106,6 +111,17 @@ func parseV2Content(content []byte) (argv [][]byte, payload []byte, ok bool) {
 	argcB, good := readNetstringStream(r)
 	if !good {
 		return nil, nil, false
+	}
+	// Canonical decimal only: reject leading '+'/'-', leading zeros ("001"), and empty. Two wire
+	// encodings of one argc value is a canonical-form hole in a hand-rolled protocol (reviewer 964
+	// #2). readNetstringStream digit-checks each netstring's LENGTH token; this checks the argc VALUE.
+	if len(argcB) == 0 || (len(argcB) > 1 && argcB[0] == '0') {
+		return nil, nil, false
+	}
+	for _, c := range argcB {
+		if c < '0' || c > '9' {
+			return nil, nil, false
+		}
 	}
 	argc, err := strconv.Atoi(string(argcB))
 	if err != nil || argc < 0 || argc > maxArgs {
@@ -170,7 +186,8 @@ func main() {
 }
 
 // runV2 is the v2 wire path (magic already consumed by main): 4-byte big-endian length, one
-// netstring whose content is <command> 0x00 <payload>, then trailing stdin forwarded to the child.
+// netstring whose content is netstring(argc) + argc argv netstrings + payload, then trailing
+// stdin forwarded to the child.
 func runV2() {
 	lenBytes := make([]byte, 4)
 	if _, err := io.ReadFull(os.Stdin, lenBytes); err != nil {
