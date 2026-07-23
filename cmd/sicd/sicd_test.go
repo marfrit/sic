@@ -75,7 +75,15 @@ func be32(n uint32) []byte {
 
 // frame builds one wire frame: magic, 4-byte BE length, netstring(command NUL payload).
 func frame(command, payload []byte) []byte {
-	ns := netstring(concat(command, []byte{0x00}, payload))
+	// v2 content = argv netstrings + the empty-netstring terminator 0:, + payload. The command is
+	// split on spaces HERE (test-side convenience); the wire itself no longer space-splits — argv
+	// arrives length-framed so `touch 'a b'` keeps its boundary.
+	var content []byte
+	for _, a := range bytes.Split(command, []byte(" ")) {
+		content = concat(content, netstring(a))
+	}
+	content = concat(content, []byte("0:,"), payload)
+	ns := netstring(content)
 	return concat([]byte{0x00}, be32(uint32(len(ns))), ns)
 }
 
@@ -588,5 +596,31 @@ func TestPumpStdinCleanEofReturnsChildStatus(t *testing.T) {
 	code := pumpStdin(dst, src, func() int { return 7 }, io.Discard)
 	if code != 7 {
 		t.Fatalf("a clean EOF is a legitimate end; must return the child's status 7, got %d", code)
+	}
+}
+
+// v2FrameArgv builds a v2 frame from EXPLICIT argv (no space-split) — the whole point of the
+// argv-netstring wire: each element is length-framed and rides untouched.
+func v2FrameArgv(argv [][]byte, payload []byte) []byte {
+	var content []byte
+	for _, a := range argv {
+		content = concat(content, netstring(a))
+	}
+	content = concat(content, []byte("0:,"), payload)
+	ns := netstring(content)
+	return concat([]byte{0x00}, be32(uint32(len(ns))), ns)
+}
+
+func TestV2ArgvBoundaryPreserved(t *testing.T) {
+	// sic's founding guarantee, now on the v2 wire: an argument containing a space is ONE argv
+	// element, never re-split. Before the argv-netstring wire this failed — the space-split gave
+	// the script two args and printed "2|a". This is the regression that pins the fix.
+	script := shScript(t, `printf '%s|%s\n' "$#" "$1"`)
+	r := runSicd(t, v2FrameArgv([][]byte{[]byte(script), []byte("a b")}, nil))
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d, stderr=%q", r.code, r.stderr)
+	}
+	if got, want := string(r.stdout), "1|a b\n"; got != want {
+		t.Fatalf("v2 argv boundary LOST: script saw %q, want %q", got, want)
 	}
 }

@@ -91,6 +91,29 @@ func readNetstringStream(r *bufio.Reader) ([]byte, bool) {
 	return content, true
 }
 
+// parseV2Content splits a v2 netstring's content into argv (a run of netstrings terminated by
+// the empty netstring 0:,) and the trailing payload. Length-framed argv preserves argument
+// boundaries and lets any byte (space, NUL, 0xFF) appear in an argument; readNetstringStream
+// bounds each element and its length token, so a hostile content cannot OOM here.
+func parseV2Content(content []byte) (argv [][]byte, payload []byte, ok bool) {
+	r := bufio.NewReader(bytes.NewReader(content))
+	for {
+		ns, good := readNetstringStream(r)
+		if !good {
+			return nil, nil, false
+		}
+		if len(ns) == 0 {
+			break // the empty netstring 0:, terminates argv
+		}
+		argv = append(argv, ns) // readNetstringStream returns a fresh slice; no aliasing
+	}
+	rest, err := io.ReadAll(r)
+	if err != nil {
+		return nil, nil, false
+	}
+	return argv, rest, true
+}
+
 func waitForChild(cmd *exec.Cmd) int {
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -151,22 +174,22 @@ func runV2() {
 		os.Exit(1)
 	}
 
-	nulIdx := bytes.IndexByte(content, 0x00)
-	if nulIdx < 0 {
-		fmt.Fprintf(os.Stderr, "sicd: content missing NUL separator\n")
+	// v2 content = argv netstrings + the empty-netstring terminator 0:, + payload. Length-framed
+	// argv PRESERVES argument boundaries (sic's founding guarantee: `touch 'a b'` is ONE file)
+	// and lets ANY byte appear in an argument — unlike the old space-split. Everything after the
+	// terminator is the payload (a nested frame for the next hop, or empty).
+	argv, payload, ok := parseV2Content(content)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "sicd: invalid v2 content (argv framing)\n")
 		os.Exit(1)
 	}
-	command := content[:nulIdx]
-	payload := content[nulIdx+1:]
-
-	argv := bytes.Split(command, []byte(" "))
+	if len(argv) == 0 {
+		fmt.Fprintf(os.Stderr, "sicd: empty command\n")
+		os.Exit(1)
+	}
 	argvStr := make([]string, len(argv))
 	for i, a := range argv {
 		argvStr[i] = string(a)
-	}
-	if len(argvStr) == 0 {
-		fmt.Fprintf(os.Stderr, "sicd: empty command\n")
-		os.Exit(1)
 	}
 
 	cmd := exec.Command(argvStr[0], argvStr[1:]...)
