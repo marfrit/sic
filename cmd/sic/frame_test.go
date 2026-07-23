@@ -2,53 +2,74 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
+	"strconv"
 	"testing"
 )
 
-// WP1 spec for v2Frame: one v2 wire frame, byte-exact to what cmd/sicd parses:
-//   0x00  +  big-endian uint32 length of the netstring  +  netstring(command 0x00 payload)
-// Hand-written byte literals (no helper arithmetic that could cancel a framer bug out of both
-// sides). Byte counts verified against cmd/sicd/main.go's readNetstring, which rejects an
-// over- or under-counted length, so these lengths must be exact.
-
-func TestV2FrameCatHi(t *testing.T) {
-	// content = "cat\x00hi" (6 bytes); netstring "6:cat\x00hi," (9 bytes); frame 14 bytes.
-	want := []byte{
-		0x00,                   // magic
-		0x00, 0x00, 0x00, 0x09, // be32(9) = length of the netstring
-		'6', ':', 'c', 'a', 't', 0x00, 'h', 'i', ',',
+// Independent reference builders (a second implementation, so a bug in frame.go can't cancel out
+// of both sides of the assertion).
+func refNS(b []byte) []byte {
+	out := []byte(strconv.Itoa(len(b)) + ":")
+	out = append(out, b...)
+	return append(out, ',')
+}
+func refFrame(content []byte) []byte {
+	ns := refNS(content)
+	f := []byte{0x00}
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], uint32(len(ns)))
+	return append(append(f, l[:]...), ns...)
+}
+func refContent(argv [][]byte, payload []byte) []byte {
+	var c []byte
+	for _, a := range argv {
+		c = append(c, refNS(a)...)
 	}
-	if got := v2Frame([]byte("cat"), []byte("hi")); !bytes.Equal(got, want) {
-		t.Fatalf("v2Frame(cat,hi) =\n % x\nwant\n % x", got, want)
+	c = append(c, "0:,"...)
+	return append(c, payload...)
+}
+
+func TestV2Frame(t *testing.T) {
+	// An argument containing a space is ONE length-framed element — sic's founding guarantee.
+	argv := [][]byte{[]byte("cat"), []byte("a b")}
+	payload := []byte("hi")
+	want := refFrame(refContent(argv, payload))
+	if got := v2Frame(argv, payload); !bytes.Equal(got, want) {
+		t.Fatalf("v2Frame =\n % x\nwant\n % x", got, want)
 	}
 }
 
-func TestV2FrameEmptyPayload(t *testing.T) {
-	// content = "x\x00" (2 bytes); netstring "2:x\x00," (5 bytes); frame 10 bytes.
-	want := []byte{
-		0x00,
-		0x00, 0x00, 0x00, 0x05, // be32(5)
-		'2', ':', 'x', 0x00, ',',
-	}
-	if got := v2Frame([]byte("x"), nil); !bytes.Equal(got, want) {
-		t.Fatalf("v2Frame(x,nil) =\n % x\nwant\n % x", got, want)
-	}
-	if got := v2Frame([]byte("x"), []byte{}); !bytes.Equal(got, want) {
-		t.Fatalf("nil and []byte{} payload must frame identically; got\n % x\nwant\n % x", got, want)
-	}
-}
-
-func TestV2FrameBinaryPayloadRidesUntouched(t *testing.T) {
-	// Payload bytes that look like framing (NUL, 0xFF, comma, colon) must ride INSIDE the
-	// netstring untouched — it is length-delimited, never re-parsed by delimiter.
+func TestV2FrameBinaryAndEmpty(t *testing.T) {
+	// Payload bytes that look like framing ride untouched; nil and []byte{} payload are identical.
+	argv := [][]byte{[]byte("x")}
 	payload := []byte{0x00, 0xFF, ',', ':'}
-	// content = "cat" + 0x00 + payload = 8 bytes; netstring "8:...," = 11 bytes; frame 16 bytes.
-	want := []byte{
-		0x00,
-		0x00, 0x00, 0x00, 0x0B, // be32(11)
-		'8', ':', 'c', 'a', 't', 0x00, 0x00, 0xFF, ',', ':', ',',
+	if got := v2Frame(argv, payload); !bytes.Equal(got, refFrame(refContent(argv, payload))) {
+		t.Fatalf("binary payload frame mismatch")
 	}
-	if got := v2Frame([]byte("cat"), payload); !bytes.Equal(got, want) {
-		t.Fatalf("v2Frame binary payload =\n % x\nwant\n % x", got, want)
+	if !bytes.Equal(v2Frame(argv, nil), v2Frame(argv, []byte{})) {
+		t.Fatal("nil and empty payload must frame identically")
+	}
+}
+
+func TestWrapHop(t *testing.T) {
+	inner := v2Frame([][]byte{[]byte("cat")}, nil)
+	// verb split on spaces, then "sicd" appended
+	want := v2Frame([][]byte{[]byte("incus"), []byte("exec"), []byte("c"), []byte("--"), []byte("sicd")}, inner)
+	if got := wrapHop("incus exec c --", inner); !bytes.Equal(got, want) {
+		t.Fatalf("wrapHop mismatch")
+	}
+}
+
+func TestBuildChain(t *testing.T) {
+	cmd := [][]byte{[]byte("cat")}
+	payload := []byte("hi")
+	if got, want := buildChain(nil, cmd, payload), v2Frame(cmd, payload); !bytes.Equal(got, want) {
+		t.Fatal("zero hops must equal a single v2 frame")
+	}
+	verbs := []string{"incus exec c --", "docker exec d"}
+	want := wrapHop(verbs[0], wrapHop(verbs[1], v2Frame(cmd, payload)))
+	if got := buildChain(verbs, cmd, payload); !bytes.Equal(got, want) {
+		t.Fatal("buildChain must fold verbs[0] as the outermost layer")
 	}
 }

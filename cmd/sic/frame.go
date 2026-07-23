@@ -3,40 +3,57 @@ package main
 import (
 	"encoding/binary"
 	"strconv"
+	"strings"
 )
 
-// v2Frame returns one v2 wire frame:
-//
-//	0x00 ++ big-endian uint32 length of the netstring ++ netstring
-//
-// where netstring = "<len>:<content>," and content = command ++ 0x00 ++ payload.
-func v2Frame(command []byte, payload []byte) []byte {
-	// Build content: command + 0x00 + payload
-	content := make([]byte, len(command)+1+len(payload))
-	copy(content, command)
-	content[len(command)] = 0x00
-	copy(content[len(command)+1:], payload)
+// nsBytes builds a djb netstring "<len>:<bytes>," over arbitrary bytes (binary-safe).
+func nsBytes(b []byte) []byte {
+	out := append([]byte(strconv.Itoa(len(b))), ':')
+	out = append(out, b...)
+	return append(out, ',')
+}
 
-	// Build netstring: "<len>:<content>,"
-	netstr := strconv.Itoa(len(content)) + ":" + string(content) + ","
+// v2Frame builds one v2 wire frame from an EXPLICIT argv (boundary-preserving) plus a payload:
+//
+//	0x00 ++ big-endian uint32 length of the netstring ++ netstring(content)
+//	content = <argv netstrings> ++ "0:," (empty-netstring terminator) ++ payload
+//
+// Length-framed argv is why `sic host touch 'a b'` sends ONE argument, not two — no space-split
+// anywhere. The payload is the next hop's nested frame, or empty for the innermost command.
+func v2Frame(argv [][]byte, payload []byte) []byte {
+	var content []byte
+	for _, a := range argv {
+		content = append(content, nsBytes(a)...)
+	}
+	content = append(content, "0:,"...) // empty netstring terminates argv
+	content = append(content, payload...)
 
-	// Build frame: 0x00 ++ be32(len(netstr)) ++ netstr
-	frame := make([]byte, 1+4+len(netstr))
+	ns := nsBytes(content)
+	frame := make([]byte, 1+4+len(ns))
 	frame[0] = 0x00
-	binary.BigEndian.PutUint32(frame[1:5], uint32(len(netstr)))
-	copy(frame[5:], netstr)
-
+	binary.BigEndian.PutUint32(frame[1:5], uint32(len(ns)))
+	copy(frame[5:], ns)
 	return frame
 }
 
-// wrapHop wraps an already-built inner frame for one chain hop.
+// wrapHop wraps an inner frame for one chain hop: the hop's argv is the runtime verb split on
+// spaces with "sicd" appended (the inner-hop peeler), and the inner frame is the payload. Verbs
+// are space-safe by construction (no spaces in container names/ids), so splitting them is fine.
 func wrapHop(verb string, inner []byte) []byte {
-	return v2Frame([]byte(verb+" sicd"), inner)
+	fields := strings.Fields(verb)
+	argv := make([][]byte, 0, len(fields)+1)
+	for _, f := range fields {
+		argv = append(argv, []byte(f))
+	}
+	argv = append(argv, []byte("sicd"))
+	return v2Frame(argv, inner)
 }
 
-// buildChain builds a chain of wrapped frames from verbs, with the innermost being v2Frame(cmd, payload).
-func buildChain(verbs []string, cmd []byte, payload []byte) []byte {
-	frame := v2Frame(cmd, payload)
+// buildChain builds the whole onion: innermost v2Frame(cmdArgv, payload), then wrap outward so
+// verbs[0] is the outermost layer (the one the host's sicd enters first). Zero verbs yields a
+// single v2 frame (a bare host with no nesting).
+func buildChain(verbs []string, cmdArgv [][]byte, payload []byte) []byte {
+	frame := v2Frame(cmdArgv, payload)
 	for i := len(verbs) - 1; i >= 0; i-- {
 		frame = wrapHop(verbs[i], frame)
 	}
