@@ -624,3 +624,26 @@ func TestV2ArgvBoundaryPreserved(t *testing.T) {
 		t.Fatalf("v2 argv boundary LOST: script saw %q, want %q", got, want)
 	}
 }
+
+// reviewer 964 #2/#3 DoS regression.
+func TestV2OuterLengthCapRejected(t *testing.T) {
+	// 0x00 + be32(0xF0000000) + no body: must exit 1 at the length check, BEFORE make() allocs.
+	r := runSicd(t, concat([]byte{0x00}, be32(0xF0000000)))
+	if r.code != 1 {
+		t.Fatalf("oversize outer netstring length must exit 1, got %d (killedBy=%v)", r.code, r.killedBy)
+	}
+}
+
+func TestV2FrameElementCapRejected(t *testing.T) {
+	// > maxArgs (4096) argv netstrings in one frame must be rejected, not accumulated.
+	var content []byte
+	for i := 0; i < 5000; i++ {
+		content = concat(content, netstring([]byte("a")))
+	}
+	content = concat(content, []byte("0:,"))
+	ns := netstring(content)
+	r := runSicd(t, concat([]byte{0x00}, be32(uint32(len(ns))), ns))
+	if r.code != 1 {
+		t.Fatalf("v2 frame over the element cap must exit 1, got %d", r.code)
+	}
+}

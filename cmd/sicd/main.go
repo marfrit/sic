@@ -96,7 +96,10 @@ func readNetstringStream(r *bufio.Reader) ([]byte, bool) {
 // boundaries and lets any byte (space, NUL, 0xFF) appear in an argument; readNetstringStream
 // bounds each element and its length token, so a hostile content cannot OOM here.
 func parseV2Content(content []byte) (argv [][]byte, payload []byte, ok bool) {
+	const maxArgs = 4096
+	const maxFrameBytes = 1 << 20
 	r := bufio.NewReader(bytes.NewReader(content))
+	total := 0
 	for {
 		ns, good := readNetstringStream(r)
 		if !good {
@@ -104,6 +107,10 @@ func parseV2Content(content []byte) (argv [][]byte, payload []byte, ok bool) {
 		}
 		if len(ns) == 0 {
 			break // the empty netstring 0:, terminates argv
+		}
+		total += len(ns)
+		if len(argv) >= maxArgs || total > maxFrameBytes {
+			return nil, nil, false // reviewer #2: bound element count + bytes, like runV1
 		}
 		argv = append(argv, ns) // readNetstringStream returns a fresh slice; no aliasing
 	}
@@ -161,6 +168,12 @@ func runV2() {
 		os.Exit(1)
 	}
 	nsLen := binary.BigEndian.Uint32(lenBytes)
+	if nsLen > 1<<24 {
+		// reviewer #3: cap BEFORE make — a raw uint32 (up to 4 GiB) was allocated before
+		// readNetstring's cap ever ran (5-byte input committed ~4 GB).
+		fmt.Fprintf(os.Stderr, "sicd: netstring length %d exceeds cap\n", nsLen)
+		os.Exit(1)
+	}
 
 	nsBuf := make([]byte, nsLen)
 	if _, err := io.ReadFull(os.Stdin, nsBuf); err != nil {
