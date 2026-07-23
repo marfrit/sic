@@ -99,20 +99,30 @@ func parseV2Content(content []byte) (argv [][]byte, payload []byte, ok bool) {
 	const maxArgs = 4096
 	const maxFrameBytes = 1 << 20
 	r := bufio.NewReader(bytes.NewReader(content))
+	// First netstring = argc (decimal). An explicit count makes the empty string a REPRESENTABLE
+	// argument: with an empty-netstring terminator, a legit "" arg was indistinguishable from the
+	// end of argv and silently truncated the command, bleeding the tail into stdin (reviewer 964
+	// #1). Reading exactly argc elements removes the collision and bounds the count (#2).
+	argcB, good := readNetstringStream(r)
+	if !good {
+		return nil, nil, false
+	}
+	argc, err := strconv.Atoi(string(argcB))
+	if err != nil || argc < 0 || argc > maxArgs {
+		return nil, nil, false
+	}
 	total := 0
-	for {
+	argv = make([][]byte, 0, argc)
+	for i := 0; i < argc; i++ {
 		ns, good := readNetstringStream(r)
 		if !good {
 			return nil, nil, false
 		}
-		if len(ns) == 0 {
-			break // the empty netstring 0:, terminates argv
-		}
 		total += len(ns)
-		if len(argv) >= maxArgs || total > maxFrameBytes {
-			return nil, nil, false // reviewer #2: bound element count + bytes, like runV1
+		if total > maxFrameBytes {
+			return nil, nil, false
 		}
-		argv = append(argv, ns) // readNetstringStream returns a fresh slice; no aliasing
+		argv = append(argv, ns) // fresh slice per element; empty "" is a valid arg now
 	}
 	rest, err := io.ReadAll(r)
 	if err != nil {

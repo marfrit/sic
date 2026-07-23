@@ -78,11 +78,12 @@ func frame(command, payload []byte) []byte {
 	// v2 content = argv netstrings + the empty-netstring terminator 0:, + payload. The command is
 	// split on spaces HERE (test-side convenience); the wire itself no longer space-splits — argv
 	// arrives length-framed so `touch 'a b'` keeps its boundary.
-	var content []byte
-	for _, a := range bytes.Split(command, []byte(" ")) {
+	args := bytes.Split(command, []byte(" "))
+	content := netstring([]byte(strconv.Itoa(len(args))))
+	for _, a := range args {
 		content = concat(content, netstring(a))
 	}
-	content = concat(content, []byte("0:,"), payload)
+	content = concat(content, payload)
 	ns := netstring(content)
 	return concat([]byte{0x00}, be32(uint32(len(ns))), ns)
 }
@@ -602,13 +603,26 @@ func TestPumpStdinCleanEofReturnsChildStatus(t *testing.T) {
 // v2FrameArgv builds a v2 frame from EXPLICIT argv (no space-split) — the whole point of the
 // argv-netstring wire: each element is length-framed and rides untouched.
 func v2FrameArgv(argv [][]byte, payload []byte) []byte {
-	var content []byte
+	content := netstring([]byte(strconv.Itoa(len(argv))))
 	for _, a := range argv {
 		content = concat(content, netstring(a))
 	}
-	content = concat(content, []byte("0:,"), payload)
+	content = concat(content, payload)
 	ns := netstring(content)
 	return concat([]byte{0x00}, be32(uint32(len(ns))), ns)
+}
+
+func TestV2EmptyArgPreserved(t *testing.T) {
+	// reviewer 964 #1: an empty "" argument must be carried, not silently dropped. The old
+	// terminator wire ran `echo A "" B` as `echo A` (B bled into stdin). With argc all three
+	// survive: echo prints "A  B" (two spaces — the empty middle arg).
+	r := runSicd(t, v2FrameArgv([][]byte{[]byte("echo"), []byte("A"), []byte(""), []byte("B")}, nil))
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d, stderr=%q", r.code, r.stderr)
+	}
+	if got, want := string(r.stdout), "A  B\n"; got != want {
+		t.Fatalf("empty arg not preserved: echo printed %q, want %q", got, want)
+	}
 }
 
 func TestV2ArgvBoundaryPreserved(t *testing.T) {

@@ -16,16 +16,17 @@ func nsBytes(b []byte) []byte {
 // v2Frame builds one v2 wire frame from an EXPLICIT argv (boundary-preserving) plus a payload:
 //
 //	0x00 ++ big-endian uint32 length of the netstring ++ netstring(content)
-//	content = <argv netstrings> ++ "0:," (empty-netstring terminator) ++ payload
+//	content = netstring(argc) ++ <argv netstrings> ++ payload
 //
 // Length-framed argv is why `sic host touch 'a b'` sends ONE argument, not two — no space-split
 // anywhere. The payload is the next hop's nested frame, or empty for the innermost command.
 func v2Frame(argv [][]byte, payload []byte) []byte {
-	var content []byte
+	// content = netstring(argc) + argv netstrings + payload. The explicit count (not an empty-
+	// netstring terminator) makes an empty "" argument representable (reviewer 964 #1).
+	content := nsBytes([]byte(strconv.Itoa(len(argv))))
 	for _, a := range argv {
 		content = append(content, nsBytes(a)...)
 	}
-	content = append(content, "0:,"...) // empty netstring terminates argv
 	content = append(content, payload...)
 
 	ns := nsBytes(content)

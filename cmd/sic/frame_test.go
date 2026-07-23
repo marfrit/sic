@@ -22,12 +22,19 @@ func refFrame(content []byte) []byte {
 	return append(append(f, l[:]...), ns...)
 }
 func refContent(argv [][]byte, payload []byte) []byte {
-	var c []byte
+	c := refNS([]byte(strconv.Itoa(len(argv)))) // argc
 	for _, a := range argv {
 		c = append(c, refNS(a)...)
 	}
-	c = append(c, "0:,"...)
 	return append(c, payload...)
+}
+
+func TestV2FrameEmptyArgRepresentable(t *testing.T) {
+	// reviewer 964 #1: an empty "" argument is a real element now, not a terminator collision.
+	argv := [][]byte{[]byte("echo"), []byte(""), []byte("x")}
+	if got := v2Frame(argv, nil); !bytes.Equal(got, refFrame(refContent(argv, nil))) {
+		t.Fatalf("empty-arg frame mismatch")
+	}
 }
 
 func TestV2Frame(t *testing.T) {
