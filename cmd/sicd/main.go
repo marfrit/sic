@@ -51,20 +51,32 @@ func readNetstring(buf []byte) ([]byte, bool) {
 // framing (non-digit length, short body, missing comma, length > 1<<24). Used by the v1 path,
 // which is a SEQUENCE of netstrings terminated by the empty netstring 0:,.
 func readNetstringStream(r *bufio.Reader) ([]byte, bool) {
-	lenStr, err := r.ReadString(':')
-	if err != nil {
-		return nil, false // EOF before ':' — truncated
-	}
-	lenStr = lenStr[:len(lenStr)-1] // drop the ':'
-	if len(lenStr) == 0 {
-		return nil, false
-	}
-	for i := 0; i < len(lenStr); i++ {
-		if lenStr[i] < '0' || lenStr[i] > '9' {
+	// Read the length token digit-by-digit with a HARD cap. This must be bounded BEFORE the
+	// value is trusted: bufio.ReadString(':') buffers the whole pre-':' run unbounded, so an
+	// endless stream of digits with no ':' drives allocation to OOM (a confined caller measured
+	// ~1 GB RSS). A valid length is <= 1<<24 = 16777216 (8 digits), so >8 digits is malformed.
+	const maxLenDigits = 8
+	var lenBuf []byte
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return nil, false // EOF before ':' — truncated
+		}
+		if b == ':' {
+			break
+		}
+		if b < '0' || b > '9' {
+			return nil, false
+		}
+		lenBuf = append(lenBuf, b)
+		if len(lenBuf) > maxLenDigits {
 			return nil, false
 		}
 	}
-	n, err := strconv.Atoi(lenStr)
+	if len(lenBuf) == 0 {
+		return nil, false
+	}
+	n, err := strconv.Atoi(string(lenBuf))
 	if err != nil || n > 1<<24 {
 		return nil, false
 	}
@@ -201,7 +213,16 @@ func runV1(r *bufio.Reader) {
 	}
 
 	// Read argv/command netstrings until the empty-netstring terminator. EOF first = truncated.
+	// Cap the frame (element count AND total bytes): readNetstringStream bounds each netstring at
+	// 1<<24, but nothing bounds their NUMBER — 2M tiny netstrings measured ~140 MB before exec.
+	// NOTE: an empty netstring 0:, is ALWAYS the terminator, so a legitimate empty "" argument
+	// collides with it — the arg list truncates there and the rest bleeds into the child's stdin.
+	// That is inherent to the v1 wire (terminator overload), not a bug introduced here; the
+	// deployed cmd/sic produces it only if a caller passes a literal "".
+	const maxArgs = 4096
+	const maxFrameBytes = 1 << 20
 	var argv []string
+	total := 0
 	for {
 		ns, ok := readNetstringStream(r)
 		if !ok {
@@ -210,6 +231,11 @@ func runV1(r *bufio.Reader) {
 		}
 		if len(ns) == 0 {
 			break // the empty netstring 0:, terminates the frame
+		}
+		total += len(ns)
+		if len(argv) >= maxArgs || total > maxFrameBytes {
+			fmt.Fprintf(os.Stderr, "sicd: v1 frame too large\n")
+			os.Exit(1)
 		}
 		argv = append(argv, string(ns))
 	}

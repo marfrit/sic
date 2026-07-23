@@ -178,3 +178,40 @@ func TestV1EmptyExecArgvRejected(t *testing.T) {
 		t.Fatal("empty v1 exec argv must produce a diagnostic on stderr")
 	}
 }
+
+// --- DoS regression (reviewer 925 findings #1/#2): the length token and the frame element
+// count must both be bounded BEFORE the value is trusted, or a protocol-confined caller OOMs
+// the host (measured ~1 GB RSS from an unbounded digit run; ~140 MB from 2M netstrings). --
+
+func TestV1OverlongLengthTokenRejected(t *testing.T) {
+	// A run of digits with no ':' must be rejected after a small cap, never buffered unbounded.
+	r := runSicd(t, bytes.Repeat([]byte("9"), 100_000))
+	if r.code != 1 {
+		t.Fatalf("overlong v1 length token must exit 1, got %d (killedBy=%v)", r.code, r.killedBy)
+	}
+	if len(r.stdout) != 0 {
+		t.Fatalf("overlong length token must exec nothing, stdout=%q", r.stdout)
+	}
+}
+
+func TestV1LengthTokenNineDigitsRejected(t *testing.T) {
+	// 9 digits (> the 8 a valid <=1<<24 length needs) is malformed, even with a ':'.
+	r := runSicd(t, []byte("100000000:x,0:,"))
+	if r.code != 1 {
+		t.Fatalf("9-digit v1 length must exit 1, got %d", r.code)
+	}
+}
+
+func TestV1FrameElementCapRejected(t *testing.T) {
+	// Too many netstrings in one frame must be rejected, not accumulated to OOM.
+	var b bytes.Buffer
+	b.Write(netstring([]byte("exec")))
+	for i := 0; i < 5000; i++ { // > maxArgs (4096)
+		b.Write(netstring([]byte("a")))
+	}
+	b.WriteString("0:,")
+	r := runSicd(t, b.Bytes())
+	if r.code != 1 {
+		t.Fatalf("v1 frame exceeding the element cap must exit 1, got %d", r.code)
+	}
+}
