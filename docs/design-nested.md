@@ -1,0 +1,81 @@
+# sic — nested (multi-hop) design & chain-resolution decision
+
+Status: **Accepted** — 2026-07-23, bullpen design session (room msgs 865–877;
+@architect / @skeptic on deepseek-v4-flash-dspark, initiated by Markus).
+This records a decision and its rejected alternatives *for the audit trail* — a future
+reader should see that mneme-as-router was considered and killed for cause, not overlooked.
+
+## Goal
+
+Make `sic host/hop1/hop2 … argv` real: run a command inside a container reached through a
+chain of hops (`incus exec`, `docker exec`, `pct exec`, …) without a shell re-parsing argv at
+any layer. The v2 wire-protocol **daemon** (`cmd/sicd`, `gateway/sicd`) already implements
+one-layer-per-hop peeling; this covers the **client** and the rollout.
+
+## Model (confirmed)
+
+The **client builds the whole onion up front**: wrap the innermost command in a frame for hop
+N, wrap that for hop N-1, … outermost for hop 1, and ship the nested blob to hop 1. **Each
+`sicd` peels exactly one layer** (its own), runs its runtime verb with `sic-run` as the
+command, and `sic-run` reads the next frame from stdin and repeats. Construction is recursive
+and up-front; unrolling is iterative and distributed.
+
+One frame = preamble (`MAGIC 0x00`, then 4-byte big-endian `len32`) + a djb netstring whose
+content is `<command> 0x00 <payload>`; the payload of a non-terminal frame is itself a full
+frame for the next hop.
+
+## Decision 1 — chain resolution: **static per-client config**
+
+`/etc/sic/hosts.toml` declares, per host, the ordered runtime verbs for its hops
+(`nest = ["incus", "docker"]`, etc.). The client reads it to turn `host/hop1/hop2` into the
+concrete verb + address at each layer. **Fail loud on any mismatch** (unknown host, more hops
+than the config declares) — never guess.
+
+### Rejected: mneme as the chain router
+
+Resolving chains by querying the fleet-memory store (mneme) was proposed and **rejected**.
+Even with the bootstrap circularity removed (mneme's own address is a flat local setting, so a
+lookup is one direct call, not a nested one), it loses on four counts:
+
+- **Trust (dispositive).** mneme is a *mutable shared* store. Any container with write access
+  poisons one chain entry and every subsequent `sic` call through that chain execs the
+  attacker's verb on the target host — a supply-chain RCE vector. Static config is
+  immutable-after-deploy and auditable once.
+- **Staleness fails the wrong way.** A moved/renamed container makes the stored chain lie, and
+  the client *silently* execs into the wrong container. Static config fails loud (connection
+  refused); mneme turns a hard error into quiet wrong-target execution.
+- **Availability.** mneme lives on boltzmann, which sleeps; resolution would die with it, and a
+  local cache to cover that is just a slower, staler config file.
+- **No net benefit.** The client needs a local mneme *address* regardless, so mneme only adds a
+  fragile network hop + cache to do what a flat file read already does.
+
+mneme remains the fleet **memory** store — this decision is narrowly about *routing*, nothing else.
+
+## Decision 2 — migration: **daemon dual-read, daemon-first**
+
+The v2 daemon hard-requires the `0x00` magic; the deployed v1 client sends a digit first, so a
+naive v2 deploy breaks every existing call on 30+ live hosts. Instead the daemon **sniffs the
+first byte** — `0x00` → v2 parser, digit → v1-legacy parser — a once-per-connection branch,
+~20 lines, zero perf cost. Ship the v2 daemon everywhere first; roll clients independently, no
+flag day.
+
+## Backward compat & the two original bugs
+
+- A **bare `--`** must survive into the innermost argv untouched (the payload is opaque bytes;
+  no hop interprets it) — closes marfrit/sic#1.
+- **stdin must be forwarded** into/through the frame — closes the silent zero-byte-file bug.
+- A **bare host** with no `/` stays a single v1-style hop (backward compatible).
+
+## Escape hatch (documented, not built)
+
+If redeploying clients on chain changes ever costs more than the trust of a live store,
+distribute **signed manifests out-of-band** — deterministic like static config, updatable like
+mneme, without the mutable-store poison vector. Future work; explicitly not today's problem.
+
+## Consequences
+
+- Chain changes require redeploying clients (accepted: moves are infrequent, rollouts controlled).
+- No network dependency and no mutable store in the routing path — routing is deterministic and
+  auditable.
+- Next: implement `cmd/sic` (config read + recursive frame build + `--`/stdin fixes) and the
+  daemon dual-read; both are Go, grindable via @godev.
