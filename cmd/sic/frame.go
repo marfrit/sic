@@ -33,3 +33,12 @@ func v2Frame(command []byte, payload []byte) []byte {
 func wrapHop(verb string, inner []byte) []byte {
 	return v2Frame([]byte(verb+" sicd"), inner)
 }
+
+// buildChain builds a chain of wrapped frames from verbs, with the innermost being v2Frame(cmd, payload).
+func buildChain(verbs []string, cmd []byte, payload []byte) []byte {
+	frame := v2Frame(cmd, payload)
+	for i := len(verbs) - 1; i >= 0; i-- {
+		frame = wrapHop(verbs[i], frame)
+	}
+	return frame
+}
