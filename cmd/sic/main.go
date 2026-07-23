@@ -13,15 +13,15 @@
 //
 //	sic host echo hi                       # run on the host
 //	sic host touch 'a b'                   # ONE file
-//	sic dcw2/noether cat /etc/os-release   # into the 'noether' guest on dcw2
-//	sic data/ct110/app id                  # host -> pct ct110 -> docker app (two hops)
+//	sic host1/app cat /etc/os-release       # into the 'app' guest on host1
+//	sic host2/ct/svc id                     # host -> pct ct -> docker svc (two hops)
 //	sic --sh host 'echo hi | wc -c'        # shell line (space-join is intended here)
 //
 // Hop runtimes come from /etc/sic/hosts.toml, one stanza per host:
 //
-//	[dcw2]
+//	[host1]
 //	nest = ["incus"]
-//	[data]
+//	[host2]
 //	nest = ["pct", "docker"]
 package main
 

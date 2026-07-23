@@ -14,9 +14,9 @@ func TestParseTarget(t *testing.T) {
 		host string
 		hops []string
 	}{
-		{"boltzmann", "boltzmann", nil},
-		{"boltzmann/memory", "boltzmann", []string{"memory"}},
-		{"boltzmann/memory/stash-stash-1", "boltzmann", []string{"memory", "stash-stash-1"}},
+		{"host1", "host1", nil},
+		{"host1/app", "host1", []string{"app"}},
+		{"host1/app/db", "host1", []string{"app", "db"}},
 	}
 	for _, tc := range cases {
 		host, hops := parseTarget(tc.in)

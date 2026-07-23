@@ -10,8 +10,8 @@ func TestVerbFor(t *testing.T) {
 	cases := []struct {
 		runtime, name, want string
 	}{
-		{"incus", "memory", "incus exec memory --"},
-		{"docker", "stash-stash-1", "docker exec stash-stash-1"},
+		{"incus", "app", "incus exec app --"},
+		{"docker", "db", "docker exec db"},
 		{"pct", "107", "pct exec 107 --"},
 	}
 	for _, tc := range cases {
