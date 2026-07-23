@@ -16,8 +16,9 @@ one-layer-per-hop peeling; this covers the **client** and the rollout.
 
 The **client builds the whole onion up front**: wrap the innermost command in a frame for hop
 N, wrap that for hop N-1, … outermost for hop 1, and ship the nested blob to hop 1. **Each
-`sicd` peels exactly one layer** (its own), runs its runtime verb with `sic-run` as the
-command, and `sic-run` reads the next frame from stdin and repeats. Construction is recursive
+`sicd` peels exactly one layer** (its own), runs its runtime verb with **`sicd` itself** as the
+command (`incus exec <c> -- sicd`), and that inner `sicd` reads the next frame from stdin and
+repeats. There is **no separate `sic-run` binary** — see Decision 3. Construction is recursive
 and up-front; unrolling is iterative and distributed.
 
 One frame = preamble (`MAGIC 0x00`, then 4-byte big-endian `len32`) + a djb netstring whose
@@ -59,6 +60,17 @@ first byte** — `0x00` → v2 parser, digit → v1-legacy parser — a once-per
 ~20 lines, zero perf cost. Ship the v2 daemon everywhere first; roll clients independently, no
 flag day.
 
+## Decision 3 — the chain link is `sicd` itself (no `sic-run` binary)
+
+An earlier draft proposed a separate `sic-run` helper as the per-hop peeler. It is **not built**:
+`sicd` is already a pure v2 frame-peeler, so the inner-hop command is just `sicd`
+(`incus exec <c> -- sicd`), and one binary deploys instead of two (Markus' call: deployment
+simplicity). **Verified empirically, not assumed** — `sicd` invoking `sicd` was run against a
+two-layer nested frame (`build sicd; frame("sicd", frame("cat", payload)) | sicd`): the payload
+reached the inner hop, exit status propagated, stderr clean. sicd calling sicd peels correctly,
+so nothing about a nested hop needs behaviour sicd lacks. The only prerequisite is that **sicd is
+present in every container a chain traverses** (a packaging/rollout item, not new code).
+
 ## Backward compat & the two original bugs
 
 - A **bare `--`** must survive into the innermost argv untouched (the payload is opaque bytes;
@@ -78,4 +90,4 @@ mneme, without the mutable-store poison vector. Future work; explicitly not toda
 - No network dependency and no mutable store in the routing path — routing is deterministic and
   auditable.
 - Next: implement `cmd/sic` (config read + recursive frame build + `--`/stdin fixes) and the
-  daemon dual-read; both are Go, grindable via @godev.
+  daemon dual-read; ensure sicd is deployed into target containers (no `sic-run` binary); both are Go, grindable via @godev.
