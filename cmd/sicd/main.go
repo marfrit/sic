@@ -197,10 +197,11 @@ func runV2() {
 		os.Exit(1)
 	}
 
-	// v2 content = argv netstrings + the empty-netstring terminator 0:, + payload. Length-framed
-	// argv PRESERVES argument boundaries (sic's founding guarantee: `touch 'a b'` is ONE file)
-	// and lets ANY byte appear in an argument — unlike the old space-split. Everything after the
-	// terminator is the payload (a nested frame for the next hop, or empty).
+	// v2 content = netstring(argc) + argc argv netstrings + payload. Length-framed argv PRESERVES
+	// argument boundaries (sic's founding guarantee: `touch 'a b'` is ONE file) and lets ANY byte
+	// appear in an argument — unlike the old space-split. The explicit argc (not an empty-netstring
+	// terminator) makes an empty "" argument representable (reviewer 964 #1); everything after the
+	// argc argv netstrings is the payload (a nested frame for the next hop, or empty).
 	argv, payload, ok := parseV2Content(content)
 	if !ok {
 		fmt.Fprintf(os.Stderr, "sicd: invalid v2 content (argv framing)\n")
