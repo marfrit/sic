@@ -1,6 +1,7 @@
 # sic
 
-Run a command on a remote host without a shell re-parsing its arguments.
+Run a command on a remote host — or inside a container several hops deep —
+without a shell re-parsing its arguments.
 
 `ssh host touch 'a b'` creates two files: `ssh` joins its arguments with spaces
 and hands the result to the remote login shell, which splits it again. `sic host
@@ -50,6 +51,38 @@ sic host1 echo '$HOME'               # literal, no expansion
 sic --sh host1 'echo hi | wc -c'
 ```
 
+## Nesting
+
+The frame survives being wrapped again, so `sic` reaches *into* containers with no
+shell anywhere in the path, at any depth. A target is a host followed by container
+hops separated by `/`:
+
+```
+sic host1/app cat /etc/os-release     # into the 'app' guest on host1
+sic host2/ct/svc touch 'a b'          # host2 -> ct -> svc, ONE file, three layers deep
+```
+
+Each host's hop runtimes come from `/etc/sic/hosts.toml`, one stanza per host:
+
+```toml
+[host1]
+nest = ["incus"]            # host1/app     ->  incus exec app -- <argv>
+
+[host2]
+nest = ["pct", "docker"]    # host2/ct/svc  ->  pct exec ct -- docker exec svc -- <argv>
+```
+
+This is what separates `sic` from a shell helper script. The `ssh` equivalent —
+
+```
+ssh host2 "pct exec ct -- docker exec svc -- touch \"a b\""
+```
+
+nests quotes inside quotes inside quotes, and every layer re-splits the arguments; a
+body containing a space, `$()`, a pipe, or a newline breaks a different layer each time.
+`sic` frames the argv once and re-frames it at each hop, so `touch 'a b'` is one file
+whether it runs on the host or three containers deep. No escaping, at any level.
+
 ## Build
 
 ```
@@ -88,5 +121,6 @@ sic host echo hello world
 ## See also
 
 - `docs/design.md` — wire format, exec modes, transport and security, prior art.
+- `docs/design-nested.md` — how nested container hops resolve.
 - `demos/quoting-hell.py` — six cases run both ways, plain `ssh` versus `sic`.
 - `SKILL.md`, `SKILL-bg.md` — agent skill definitions (foreground and background).
