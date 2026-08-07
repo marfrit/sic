@@ -6,6 +6,8 @@
 # remote host's MCP tools without a persistent MCP session. Three forms:
 #
 #   lmcp-tool list                              # DISCOVERY: available tools + descriptions
+#   lmcp-tool list --json                       # same, but full tools/list incl. inputSchema
+#   lmcp-tool --json <tool> key=value ...       # full result object (content[] + isError)
 #   lmcp-tool <tool> key=value [key=value ...]  # args as pairs — NO json-in-shell (apostrophe-safe)
 #   lmcp-tool fetch_url https://example.com       # a bare http(s):// arg is auto-mapped to url=
 #   lmcp-tool <tool> '{"k":"v"}'                # raw JSON (single arg starting with '{')
@@ -16,9 +18,14 @@
 # host/port/token come from, in order: $LMCP_HOST/$LMCP_PORT/$LMCP_TOKEN → the lmcp.service
 # systemd unit Environment= → the file it points at via LMCP_CONF (sudo -n if root-only;
 # key godparticle|token|bearer). Defaults to 127.0.0.1:8080.
+# --json darf vorne stehen (maschinelle Verbraucher) oder bei `list` hinten.
+json_out=0
+if [ "$1" = "--json" ]; then json_out=1; shift; fi
+
 tool="$1"
-[ -n "$tool" ] || { echo "usage: lmcp-tool <tool> [ key=value ... | '{json}' ]   |   lmcp-tool list" >&2; exit 2; }
+[ -n "$tool" ] || { echo "usage: lmcp-tool [--json] <tool> [ key=value ... | '{json}' ]   |   lmcp-tool list [--json]" >&2; exit 2; }
 shift
+[ "$1" = "--json" ] && { json_out=1; shift; }
 
 host="$LMCP_HOST"; port="$LMCP_PORT"; tok="$LMCP_TOKEN"
 env=$(systemctl show lmcp.service -p Environment 2>/dev/null | tr ' ' '\n')
@@ -46,10 +53,17 @@ raw = sys.stdin.read().strip()
 if not raw: sys.stderr.write("lmcp-tool: empty response (unreachable or auth failed)\n"); sys.exit(1)
 d = json.loads(raw.splitlines()[-1])
 if "error" in d: sys.stderr.write("lmcp error: %s\n" % d["error"]); sys.exit(1)
-for t in d.get("result", {}).get("tools", []):
-    desc = (t.get("description") or "").splitlines()[0] if t.get("description") else ""
-    print("%-16s %s" % (t.get("name","?"), desc))
-'
+res = d.get("result", {})
+if sys.argv[1] == "1":
+    # Vollstaendig, inklusive inputSchema - das braucht ein Modell, um die
+    # Parameter richtig zu setzen. Die Prosa-Beschreibung allein reicht nicht.
+    json.dump(res, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+else:
+    for t in res.get("tools", []):
+        desc = (t.get("description") or "").splitlines()[0] if t.get("description") else ""
+        print("%-16s %s" % (t.get("name","?"), desc))
+' "$json_out"
     exit $?
 fi
 
@@ -83,6 +97,13 @@ if "error" in d:
     sys.stderr.write("lmcp error: %s\n" % d["error"])
     sys.stderr.write("hint: run  lmcp-tool list  to see valid tool names\n"); sys.exit(1)
 r = d.get("result", {})
+if sys.argv[1] == "1":
+    # MCP-Semantik: der Inhalt ist auch bei isError massgeblich und gehoert
+    # an das Modell durchgereicht. Rueckgabewert 0, sobald eine gueltige
+    # Antwort vorliegt - 1 bleibt dem Transportfehler vorbehalten.
+    json.dump(r, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    sys.exit(0)
 print("\n".join(c["text"] for c in r.get("content", []) if c.get("type") == "text"))
 sys.exit(1 if r.get("isError") else 0)
-'
+' "$json_out"
