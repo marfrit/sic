@@ -84,6 +84,11 @@ func main() {
 	if len(rest) == 0 {
 		fatal("missing command")
 	}
+	// A whole command line quoted into one word can only fail, and it fails in a
+	// way that blames the far end. Say so here, where the intent is still visible.
+	if !shMode && looksLikeShellLine(rest) {
+		fatal("%s", shellLineHint(rest[0]))
+	}
 
 	// Build the command argv, boundary-preserved. --sh is the sole place a space-join is
 	// correct: the user asked for a shell line, not an argv.
