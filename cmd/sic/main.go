@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	sic [--sh] <target> [--] <command> [<arg> ...]
+//	sic [--sh | --kill] <target> [--] <command> [<arg> ...]
 //
 // A target is a host, optionally followed by container hops separated by '/':
 //
@@ -16,6 +16,8 @@
 //	sic host1/app cat /etc/os-release       # into the 'app' guest on host1
 //	sic host2/ct/svc id                     # host -> pct ct -> docker svc (two hops)
 //	sic --sh host 'echo hi | wc -c'        # shell line (space-join is intended here)
+//	sic --kill host llama-server           # list matches, never touching our own tree
+//	sic --kill host llama-server --force   # and signal them
 //
 // Hop runtimes come from /etc/sic/hosts.toml, one stanza per host:
 //
@@ -26,6 +28,7 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
 	"io"
 	"os"
@@ -33,13 +36,24 @@ import (
 	"strings"
 )
 
+// sickill runs on the far end as `python3 -`, so it needs no installation there.
+// It exists because `pkill -f <pattern>` cannot avoid matching the caller: the
+// caller's own command line contains the pattern, because the caller just typed
+// it. Over ssh that kills this very session (exit 255); over an MCP shell tool it
+// kills the `sh -c '(...)'` wrapper and its forks (measured: 1 self-hit over ssh,
+// 3 over lmcp, 2026-09-13).
+//
+//go:embed sickill.py
+var sickillPy []byte
+
 func fatal(format string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, "sic: "+format+"\n", a...)
 	os.Exit(1)
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "Usage: sic [--sh] <target> [--] <command> [<arg> ...]")
+	fmt.Fprintln(os.Stderr, "Usage: sic [--sh | --kill] <target> [--] <command> [<arg> ...]")
+	fmt.Fprintln(os.Stderr, "  --kill <target> <pattern> [-x] [--force] [-s SIGNAL]  kill by pattern, never your own tree")
 	os.Exit(1)
 }
 
@@ -65,11 +79,23 @@ func loadNest(host string) ([]string, error) {
 func main() {
 	args := os.Args[1:]
 
-	// --sh is the only leading flag. Everything after the target is the command.
-	shMode := false
-	if len(args) > 0 && args[0] == "--sh" {
-		shMode = true
-		args = args[1:]
+	// Leading flags. Everything after the target is the command.
+	shMode, killMode := false, false
+	for len(args) > 0 {
+		if args[0] == "--sh" {
+			shMode = true
+			args = args[1:]
+			continue
+		}
+		if args[0] == "--kill" {
+			killMode = true
+			args = args[1:]
+			continue
+		}
+		break
+	}
+	if shMode && killMode {
+		fatal("--sh and --kill are mutually exclusive")
 	}
 	if len(args) < 1 {
 		usage()
@@ -86,14 +112,23 @@ func main() {
 	}
 	// A whole command line quoted into one word can only fail, and it fails in a
 	// way that blames the far end. Say so here, where the intent is still visible.
-	if !shMode && looksLikeShellLine(rest) {
+	// Not in --kill mode: there `rest` is a pattern, and a pattern is allowed to
+	// look like anything at all.
+	if !shMode && !killMode && looksLikeShellLine(rest) {
 		fatal("%s", shellLineHint(rest[0]))
 	}
 
 	// Build the command argv, boundary-preserved. --sh is the sole place a space-join is
 	// correct: the user asked for a shell line, not an argv.
 	var cmdArgv [][]byte
-	if shMode {
+	if killMode {
+		// The far end runs the embedded script from stdin; the pattern and any
+		// flags travel as argv, so they keep their boundaries like everything else.
+		cmdArgv = [][]byte{[]byte("python3"), []byte("-")}
+		for _, a := range rest {
+			cmdArgv = append(cmdArgv, []byte(a))
+		}
+	} else if shMode {
 		cmdArgv = [][]byte{[]byte("sh"), []byte("-c"), []byte(strings.Join(rest, " "))}
 	} else {
 		cmdArgv = make([][]byte, len(rest))
@@ -137,10 +172,19 @@ func main() {
 	if _, err := stdin.Write(frame); err != nil {
 		fatal("write frame: %v", err)
 	}
-	go func() {
-		io.Copy(stdin, os.Stdin)
+	if killMode {
+		// The script IS the far end's stdin -- our own stdin stays untouched, so
+		// `sic --kill` works from a terminal without blocking on a read that never EOFs.
+		if _, err := stdin.Write(sickillPy); err != nil {
+			fatal("write sickill: %v", err)
+		}
 		stdin.Close()
-	}()
+	} else {
+		go func() {
+			io.Copy(stdin, os.Stdin)
+			stdin.Close()
+		}()
+	}
 
 	if err := cmd.Wait(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {

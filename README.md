@@ -51,6 +51,36 @@ sic host1 echo '$HOME'               # literal, no expansion
 sic --sh host1 'echo hi | wc -c'
 ```
 
+## --kill: killing by pattern without killing yourself
+
+```
+sic --kill <host> <pattern> [-x] [--force] [-s SIGNAL]
+```
+
+`pkill -f <pattern>` cannot avoid matching the caller, because the caller's own
+command line contains the pattern — they just typed it. Over ssh that kills the
+session (`exit 255`); through an MCP shell tool it kills the `sh -c '(...)'`
+wrapper and its forks. Measured on one box: **one self-hit over ssh, three over
+lmcp**, against a single real target.
+
+`--kill` ships an embedded Python script to the far end over stdin (so nothing
+needs installing there) and excludes the caller's own process tree by
+construction: this process, its descendants, its ancestors up to — but not
+including — PID 1, and any fork carrying an ancestor's exact command line. A real
+target never matches those.
+
+```
+sic --kill host1 llama-server          # list matches; signals nothing
+sic --kill host1 llama-server --force  # send SIGTERM to the listed pids
+sic --kill host1 llama-server -x       # match argv[0]'s basename, not a substring
+sic --kill host1 'port 8095' -s KILL --force
+```
+
+Listing is the default on purpose: you see the pids before anything is signalled.
+Exit status is `0` when there were matches, `1` when there were none.
+
+Requires `python3` on the target.
+
 ## Nesting
 
 The frame survives being wrapped again, so `sic` reaches *into* containers with no
